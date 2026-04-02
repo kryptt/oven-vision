@@ -1,0 +1,113 @@
+go2rtc_url: "http://go2rtc.home:1984/api/frame.jpeg?src=kitchen"
+
+mqtt:
+  host: mosquitto.home
+  port: 1883
+  keepalive_secs: 30
+
+poll_interval_secs: 5
+debug_port: 8080
+
+capture:
+  dir: "/data/captures"
+  max_files: 200
+  min_interval_secs: 300
+  confidence_threshold: 0.25
+
+# Dials left-to-right on the range cooker front panel.
+# off_angle_deg is measured by the calibrate tool with all dials at off (3 o'clock).
+dials:
+  # Position 1: Left oven chamber mode (drives left LED)
+  - label: oven_left_mode
+    center_x: 1430
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 54.0
+    off_tolerance_deg: 20.0
+
+  # Position 2: Top-left gas burner
+  - label: burner_top_left
+    center_x: 1490
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 226.0
+    off_tolerance_deg: 20.0
+
+  # Position 3: Bottom-left gas burner
+  - label: burner_bottom_left
+    center_x: 1555
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 3.0
+    off_tolerance_deg: 20.0
+
+  # Position 4: Left oven temp (0°C@3o'clock → 200°C@12 → 400°C@6, CCW)
+  - label: oven_left_temp
+    center_x: 1620
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 348.0
+    off_tolerance_deg: 20.0
+
+  # Position 5: Top-center gas burner
+  - label: burner_top_center
+    center_x: 1685
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 353.0
+    off_tolerance_deg: 20.0
+
+  # Position 6: Bottom-center gas burner
+  - label: burner_bottom_center
+    center_x: 1750
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 183.0
+    off_tolerance_deg: 20.0
+
+  # Position 7: Top-right gas burner
+  - label: burner_top_right
+    center_x: 1830
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 310.0
+    off_tolerance_deg: 20.0
+
+  # Position 8: Bottom-right gas burner
+  - label: burner_bottom_right
+    center_x: 1895
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 3.0
+    off_tolerance_deg: 20.0
+
+  # Position 9: Right oven temp (same CCW scale as position 4)
+  - label: oven_right_temp
+    center_x: 1965
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 189.0
+    off_tolerance_deg: 20.0
+
+  # Position 10: Right oven chamber mode (drives right LED)
+  - label: oven_right_mode
+    center_x: 2030
+    center_y: 1040
+    radius: 28
+    off_angle_deg: 14.0
+    off_tolerance_deg: 20.0
+
+# LED indicators: left LED driven by oven_left_mode (pos 1),
+# right LED driven by oven_right_mode (pos 10)
+leds:
+  - label: oven_left_led
+    x: 1860
+    y: 1010
+    width: 20
+    height: 15
+
+  - label: oven_right_led
+    x: 1995
+    y: 1010
+    width: 20
+    height: 15
