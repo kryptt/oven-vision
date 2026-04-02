@@ -1,6 +1,19 @@
 use serde::Deserialize;
 use std::{fmt, io};
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct PerspectiveConfig {
+    /// 4 source points in the original image: top-left, top-right, bottom-right, bottom-left
+    /// of the dial panel area (identified by the chrome trim lines)
+    pub src: [[f32; 2]; 4],
+    /// 4 destination points: where to map them (a level rectangle)
+    pub dst: [[f32; 2]; 4],
+    /// Output width of the corrected crop
+    pub width: u32,
+    /// Output height of the corrected crop
+    pub height: u32,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub go2rtc_url: String,
@@ -14,6 +27,7 @@ pub struct Config {
     pub capture: CaptureConfig,
     #[serde(default = "default_debug_port")]
     pub debug_port: u16,
+    pub perspective: Option<PerspectiveConfig>,
 }
 
 #[derive(Debug, Deserialize)]

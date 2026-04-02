@@ -12,21 +12,15 @@ const DEFAULT_URL: &str = "http://192.168.2.52:1984/api/frame.jpeg?src=kitchen";
 fn default_dials() -> Vec<DialConfig> {
     vec![
         // Position 1: Left oven mode (drives left LED)
-        DialConfig { label: "oven_left_mode".into(),    center_x: 1430, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
-        // Position 2: Top-left gas burner
-        DialConfig { label: "burner_top_left".into(),   center_x: 1490, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
-        // Position 3: Bottom-left gas burner
-        DialConfig { label: "burner_bottom_left".into(),center_x: 1555, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
-        // Position 4: Left oven temp (0-400°C CCW from 3 o'clock)
-        DialConfig { label: "oven_left_temp".into(),    center_x: 1620, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
-        // Position 5: Top-center gas burner
-        DialConfig { label: "burner_top_center".into(), center_x: 1685, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
-        // Position 6: Bottom-center gas burner
-        DialConfig { label: "burner_bottom_center".into(), center_x: 1750, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
-        // Position 7: Top-right gas burner
-        DialConfig { label: "burner_top_right".into(),  center_x: 1830, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
-        // Position 8: Bottom-right gas burner
-        DialConfig { label: "burner_bottom_right".into(), center_x: 1895, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
+        // Precise per-dial coordinates from HoughCircles detection targeting inner knobs
+        DialConfig { label: "oven_left_mode".into(),       center_x: 1430, center_y: 1059, radius: 10, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
+        DialConfig { label: "burner_top_left".into(),      center_x: 1491, center_y: 1097, radius: 14, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
+        DialConfig { label: "burner_bottom_left".into(),   center_x: 1551, center_y: 1112, radius: 14, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
+        DialConfig { label: "oven_left_temp".into(),       center_x: 1609, center_y: 1103, radius: 14, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
+        DialConfig { label: "burner_top_center".into(),    center_x: 1677, center_y: 1101, radius: 14, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
+        DialConfig { label: "burner_bottom_center".into(), center_x: 1753, center_y: 1116, radius:  9, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
+        DialConfig { label: "burner_top_right".into(),     center_x: 1844, center_y: 1077, radius: 14, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
+        DialConfig { label: "burner_bottom_right".into(),  center_x: 1893, center_y: 1077, radius: 14, off_angle_deg: 0.0, off_tolerance_deg: 25.0 },
         // Position 9: Right oven temp (same CCW scale)
         DialConfig { label: "oven_right_temp".into(),   center_x: 1965, center_y: 1085, radius: 28, off_angle_deg: 0.0, off_tolerance_deg: 20.0 },
         // Position 10: Right oven mode (drives right LED)
@@ -127,8 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     frame.save(&args.reference_path)?;
     eprintln!("Reference image saved to {:?}", args.reference_path);
 
-    // Preprocess for edge detection
-    let gray = preprocess(&frame);
+    // Preprocess for edge detection (no perspective correction in calibration)
+    let gray = preprocess(&frame, None);
 
     // Use Canny edge detection (same params as the detector)
     let edges = imageproc::edges::canny(&gray, 10.0, 30.0);

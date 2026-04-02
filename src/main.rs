@@ -4,7 +4,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use oven_vision::annotate::{annotate_frame, encode_jpeg};
+use oven_vision::annotate::{annotate_frame, apply_perspective, encode_jpeg};
 use oven_vision::capture::fetch_frame;
 use oven_vision::capture_store::CaptureStore;
 use oven_vision::config;
@@ -79,10 +79,10 @@ async fn main() {
     loop {
         match fetch_frame(&client, &cfg.go2rtc_url).await {
             Ok(frame) => {
-                let gray = preprocess(&frame);
+                let gray = preprocess(&frame, cfg.perspective.as_ref());
                 info!(
-                    width = frame.width(),
-                    height = frame.height(),
+                    width = gray.width(),
+                    height = gray.height(),
                     "frame captured and preprocessed"
                 );
 
@@ -91,18 +91,25 @@ async fn main() {
                     info!(%reading, "dial reading");
                 }
 
-                let led_readings = detect_leds(&frame, &cfg.leds);
+                // Use warped color frame for LED detection when perspective is active
+                let color_frame = match cfg.perspective.as_ref() {
+                    Some(pcfg) => apply_perspective(&frame, pcfg),
+                    None => frame.clone(),
+                };
+                let led_readings = detect_leds(&color_frame, &cfg.leds);
                 for led in &led_readings {
                     info!(label = %led.label, state = %led.state, "led reading");
                 }
 
-                // Build annotated debug frame
+                // Build annotated debug frame on the warped color frame
+                // (ROI coordinates are in warped space)
                 let annotated = annotate_frame(
-                    &frame,
+                    &color_frame,
                     &readings,
                     &led_readings,
                     &cfg.dials,
                     &cfg.leds,
+                    None, // already warped, no additional perspective needed
                 );
 
                 // Build JPEG for debug frame

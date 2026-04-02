@@ -50,7 +50,7 @@ pub struct DialDetector {
 const MAX_ROTATION_DEG: f64 = 180.0;
 
 /// Minimum normalized edge strength to consider a detection valid.
-const MIN_EDGE_STRENGTH: f64 = 0.15;
+const MIN_EDGE_STRENGTH: f64 = 0.05;
 
 /// Number of radial sample points per angle.
 const RADIAL_SAMPLES: u32 = 15;
