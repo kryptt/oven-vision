@@ -14,6 +14,47 @@ pub struct Config {
     pub capture: CaptureConfig,
     #[serde(default = "default_debug_port")]
     pub debug_port: u16,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PipelineConfig {
+    /// Initial crop region hint (x, y, width, height). If omitted, uses a
+    /// built-in default covering the known stove panel area.
+    pub initial_crop: Option<CropConfig>,
+    /// Maximum fresh frames to try during calibration before giving up.
+    #[serde(default = "default_max_frame_attempts")]
+    pub max_frame_attempts: u32,
+    /// Path for the pipeline cache file.
+    #[serde(default = "default_cache_path")]
+    pub cache_path: String,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            initial_crop: None,
+            max_frame_attempts: default_max_frame_attempts(),
+            cache_path: default_cache_path(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CropConfig {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn default_max_frame_attempts() -> u32 {
+    5
+}
+
+fn default_cache_path() -> String {
+    "/data/captures/pipeline_cache.json".to_string()
 }
 
 #[derive(Debug, Deserialize)]

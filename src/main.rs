@@ -1,5 +1,5 @@
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use opencv::prelude::*;
 use tracing::{error, info, warn};
@@ -8,18 +8,33 @@ use tracing_subscriber::EnvFilter;
 use oven_vision::annotate::{annotate_frame, encode_jpeg};
 use oven_vision::capture::fetch_frame;
 use oven_vision::capture_store::CaptureStore;
-use oven_vision::config;
-use oven_vision::debug_server::{run_debug_server, DebugState};
+use oven_vision::config::{self, Config};
+use oven_vision::debug_server::{DebugState, run_debug_server};
 use oven_vision::detect::DialDetector;
 use oven_vision::led::detect_leds;
 use oven_vision::mqtt::MqttPublisher;
+use oven_vision::pipeline::find_features::FindFeatures;
+use oven_vision::pipeline::find_lines::FindLines;
+use oven_vision::pipeline::find_stove::FindStove;
+use oven_vision::pipeline::find_verticals::FindVerticals;
+use oven_vision::pipeline::perspective::Perspective;
+use oven_vision::pipeline::sanity::{SanityCheck, quick_sanity_check};
+use oven_vision::pipeline::stage::CropRegion;
+use oven_vision::pipeline::{self, Pipeline, PipelineError};
 use oven_vision::preprocess::preprocess;
+
+/// How often to run the quick sanity check (every Nth frame).
+const SANITY_CHECK_INTERVAL: u64 = 10;
+
+/// Duration of consecutive sanity failures before triggering recalibration.
+const RECALIBRATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("oven_vision=info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("oven_vision=info")),
         )
         .init();
 
@@ -30,8 +45,6 @@ async fn main() {
                 leds = cfg.leds.len(),
                 poll_interval_secs = cfg.poll_interval_secs,
                 mqtt_host = %cfg.mqtt.host,
-                mqtt_user = ?cfg.mqtt.user,
-                mqtt_has_pass = cfg.mqtt.pass.is_some(),
                 "configuration loaded"
             );
             cfg
@@ -42,7 +55,7 @@ async fn main() {
         }
     };
 
-    // Initialize MQTT publisher
+    // Initialize MQTT publisher (connection starts later after calibration)
     let mut publisher = match MqttPublisher::new(&cfg.mqtt) {
         Ok(p) => p,
         Err(err) => {
@@ -52,13 +65,6 @@ async fn main() {
     };
 
     let debug_state = DebugState::new();
-
-    if let Err(err) = publisher.start(&cfg.dials, &cfg.leds).await {
-        error!(%err, "failed to start MQTT publisher");
-        std::process::exit(1);
-    }
-
-    debug_state.set_mqtt_connected(true);
     tokio::spawn(run_debug_server(debug_state.clone(), cfg.debug_port));
 
     let client = reqwest::Client::builder()
@@ -75,23 +81,75 @@ async fn main() {
     );
 
     let poll_interval = Duration::from_secs(cfg.poll_interval_secs);
-    let mut detector = DialDetector::new(cfg.dials.clone());
+
+    // --- v2 Pipeline: calibrate or load cache ---
+    let mut pipe = build_pipeline(&cfg);
+
+    let initial_frame = match fetch_frame(&client, &cfg.go2rtc_url).await {
+        Ok(f) => f,
+        Err(err) => {
+            error!(%err, "failed to fetch initial frame");
+            std::process::exit(1);
+        }
+    };
+    let (frame_w, frame_h) = (initial_frame.cols() as u32, initial_frame.rows() as u32);
+    info!(frame_w, frame_h, "initial frame captured");
+
+    if !pipe.try_load_cache(frame_w, frame_h) {
+        info!("running full calibration pipeline");
+        if let Err(err) = run_calibration(&mut pipe, &client, &cfg.go2rtc_url) {
+            save_calibration_debug_images(&pipe, &capture_dir);
+            error!(%err, "calibration failed");
+            std::process::exit(1);
+        }
+        save_calibration_debug_images(&pipe, &capture_dir);
+    }
+
+    // Build detector from pipeline-discovered knob positions
+    let labels: Vec<String> = cfg.dials.iter().map(|d| d.label.clone()).collect();
+    let labels_ref = if labels.is_empty() {
+        None
+    } else {
+        Some(labels.as_slice())
+    };
+    let features = pipe
+        .state()
+        .features
+        .as_ref()
+        .expect("pipeline has no features");
+    let mut detector = DialDetector::from_features(features, labels_ref);
+
+    // Start MQTT with pipeline-derived dial configs
+    if let Err(err) = publisher.start(detector.configs(), &cfg.leds).await {
+        error!(%err, "failed to start MQTT publisher");
+        std::process::exit(1);
+    }
+    debug_state.set_mqtt_connected(true);
+
+    // --- Detection loop ---
+    let mut sanity_fail_start: Option<Instant> = None;
+    let mut frame_count: u64 = 0;
 
     loop {
         match fetch_frame(&client, &cfg.go2rtc_url).await {
             Ok(frame) => {
-                let gray = match preprocess(&frame) {
+                // Apply cached perspective warp
+                let warped = match pipeline::warp_frame(pipe.state(), &frame) {
+                    Ok(w) => w,
+                    Err(err) => {
+                        error!(%err, "warp failed");
+                        continue;
+                    }
+                };
+
+                // Preprocess warped image for edge-based dial detection
+                let gray = match preprocess(&warped) {
                     Ok(g) => g,
                     Err(err) => {
                         error!(%err, "preprocessing failed");
                         continue;
                     }
                 };
-                info!(
-                    width = gray.cols(),
-                    height = gray.rows(),
-                    "frame captured and preprocessed"
-                );
 
                 let readings = match detector.detect_all(&gray) {
                     Ok(r) => r,
@@ -104,6 +162,7 @@ async fn main() {
                     info!(%reading, "dial reading");
                 }
 
+                // LED detection runs on the raw (unwarped) frame
                 let led_readings = match detect_leds(&frame, &cfg.leds) {
                     Ok(r) => r,
                     Err(err) => {
@@ -115,22 +174,17 @@ async fn main() {
                     info!(label = %led.label, state = %led.state, "led reading");
                 }
 
-                // Build annotated debug frame
-                let annotated = match annotate_frame(
-                    &frame,
-                    &readings,
-                    &led_readings,
-                    &cfg.dials,
-                    &cfg.leds,
-                ) {
-                    Ok(a) => a,
-                    Err(err) => {
-                        error!(%err, "annotation failed");
-                        continue;
-                    }
-                };
+                // Annotate the warped image with dial overlays (LEDs are on the
+                // raw frame so we pass empty slices for them here)
+                let annotated =
+                    match annotate_frame(&warped, &readings, &[], detector.configs(), &[]) {
+                        Ok(a) => a,
+                        Err(err) => {
+                            error!(%err, "annotation failed");
+                            continue;
+                        }
+                    };
 
-                // Build JPEG for debug frame
                 let jpeg = match encode_jpeg(&annotated, 80) {
                     Ok(j) => j,
                     Err(err) => {
@@ -139,7 +193,6 @@ async fn main() {
                     }
                 };
 
-                // Update shared debug state
                 debug_state.update_frame(jpeg.clone());
                 debug_state.set_frames_flowing(true);
 
@@ -155,15 +208,50 @@ async fn main() {
 
                 // Save low-confidence captures
                 match capture_store.maybe_capture(&annotated, &readings) {
-                    Ok(Some(path)) => {
-                        info!(path = %path.display(), "low-confidence frame saved");
-                    }
+                    Ok(Some(path)) => info!(path = %path.display(), "low-confidence frame saved"),
                     Ok(None) => {}
-                    Err(err) => {
-                        warn!(%err, "failed to save low-confidence capture");
+                    Err(err) => warn!(%err, "failed to save low-confidence capture"),
+                }
+
+                // Periodic sanity check
+                frame_count += 1;
+                if frame_count % SANITY_CHECK_INTERVAL == 0 {
+                    match quick_sanity_check(&warped) {
+                        Ok(true) => {
+                            if sanity_fail_start.take().is_some() {
+                                info!("sanity check recovered");
+                            }
+                        }
+                        Ok(false) => {
+                            let start = *sanity_fail_start.get_or_insert_with(|| {
+                                warn!("sanity check failed, starting recalibration timer");
+                                Instant::now()
+                            });
+                            if start.elapsed() >= RECALIBRATION_TIMEOUT {
+                                warn!("sanity failures exceeded 15 min, recalibrating");
+                                pipe = build_pipeline(&cfg);
+                                match run_calibration(&mut pipe, &client, &cfg.go2rtc_url) {
+                                    Ok(()) => {
+                                        save_calibration_debug_images(&pipe, &capture_dir);
+                                        let f = pipe.state().features.as_ref().unwrap();
+                                        detector = DialDetector::from_features(f, labels_ref);
+                                        info!("recalibration complete");
+                                    }
+                                    Err(err) => {
+                                        save_calibration_debug_images(&pipe, &capture_dir);
+                                        error!(%err, "recalibration failed, keeping old state");
+                                    }
+                                }
+                                sanity_fail_start = None;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(%err, "sanity check error");
+                        }
                     }
                 }
 
+                // Publish MQTT
                 let led_states: Vec<(String, _)> = led_readings
                     .iter()
                     .map(|r| (r.label.clone(), r.state))
@@ -179,5 +267,72 @@ async fn main() {
         }
 
         tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Build the 6-stage calibration pipeline from config.
+fn build_pipeline(cfg: &Config) -> Pipeline {
+    let stages: Vec<Box<dyn pipeline::Stage>> = vec![
+        Box::new(match &cfg.pipeline.initial_crop {
+            Some(crop) => FindStove::with_crop(CropRegion {
+                x: crop.x,
+                y: crop.y,
+                width: crop.width,
+                height: crop.height,
+            }),
+            None => FindStove::new(),
+        }),
+        Box::new(FindLines::new()),
+        Box::new(FindVerticals::new()),
+        Box::new(Perspective::new()),
+        Box::new(FindFeatures::new()),
+        Box::new(SanityCheck::new()),
+    ];
+
+    Pipeline::new(
+        stages,
+        pipeline::PipelineConfig {
+            cache_path: PathBuf::from(&cfg.pipeline.cache_path),
+            max_frame_attempts: cfg.pipeline.max_frame_attempts,
+        },
+    )
+}
+
+/// Run calibration using async frame fetching bridged into the sync pipeline.
+fn run_calibration(
+    pipe: &mut Pipeline,
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(), PipelineError> {
+    let handle = tokio::runtime::Handle::current();
+    pipe.calibrate_with_fetch(|| {
+        tokio::task::block_in_place(|| handle.block_on(fetch_frame(client, url)))
+            .map_err(|e| PipelineError::Exhausted(format!("frame fetch: {e}")))
+    })
+}
+
+/// Write per-stage debug images from the last calibration run to disk.
+/// Called after both successful and failed calibration so the images are
+/// always available for inspection.
+fn save_calibration_debug_images(pipe: &Pipeline, capture_dir: &Path) {
+    let images = pipe.debug_images();
+    if images.is_empty() {
+        info!("no calibration debug images to save");
+        return;
+    }
+
+    if let Err(err) = std::fs::create_dir_all(capture_dir) {
+        warn!(%err, "failed to create capture directory for debug images");
+        return;
+    }
+
+    for (label, jpeg) in images {
+        // label is like "S1:FindStove" → filename "calibration_S1_FindStove.jpg"
+        let filename = format!("calibration_{}.jpg", label.replace(':', "_"));
+        let path = capture_dir.join(&filename);
+        match std::fs::write(&path, jpeg) {
+            Ok(()) => info!(path = %path.display(), label, "saved calibration debug image"),
+            Err(err) => warn!(%err, label, "failed to save calibration debug image"),
+        }
     }
 }

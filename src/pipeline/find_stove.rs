@@ -1,0 +1,140 @@
+use opencv::core::{Mat, Rect, Scalar};
+use opencv::imgproc;
+use opencv::prelude::*;
+
+use super::stage::{CropRegion, PipelineState, StageId, StageOutcome};
+use super::{DebugImage, Stage};
+use crate::annotate::encode_jpeg;
+
+/// Default crop region covering the stove panel with generous margins.
+/// Derived from the Python spike: dials sit around x=1350-2120, y=980-1100
+/// in the 2560x1440 frame. Extra horizontal margin to capture panel edges
+/// for vertical line detection.
+const DEFAULT_CROP: CropRegion = CropRegion {
+    x: 1300,
+    y: 830,
+    width: 870,
+    height: 450,
+};
+
+/// On each retry, expand the crop by this many pixels per side.
+const MARGIN_STEP: u32 = 20;
+
+/// Stage 1: Crop the frame to the stove panel area.
+///
+/// Uses a configurable initial crop region. On retries, progressively expands
+/// the margins to capture more of the panel if subsequent stages fail and
+/// fall back here.
+pub struct FindStove {
+    initial_crop: CropRegion,
+}
+
+impl FindStove {
+    pub fn new() -> Self {
+        Self {
+            initial_crop: DEFAULT_CROP,
+        }
+    }
+
+    pub fn with_crop(crop: CropRegion) -> Self {
+        Self { initial_crop: crop }
+    }
+
+    /// Compute the crop region for a given iteration, expanding margins.
+    fn crop_for_iteration(&self, iteration: u32, frame_w: u32, frame_h: u32) -> CropRegion {
+        let expand = iteration * MARGIN_STEP;
+        let x = self.initial_crop.x.saturating_sub(expand);
+        let y = self.initial_crop.y.saturating_sub(expand);
+        let right = (self.initial_crop.x + self.initial_crop.width + expand).min(frame_w);
+        let bottom = (self.initial_crop.y + self.initial_crop.height + expand).min(frame_h);
+        CropRegion {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+}
+
+impl Stage for FindStove {
+    fn id(&self) -> StageId {
+        StageId::FindStove
+    }
+
+    fn run(
+        &self,
+        state: &mut PipelineState,
+        frame: &Mat,
+        iteration: u32,
+    ) -> Result<StageOutcome, opencv::Error> {
+        let frame_w = frame.cols() as u32;
+        let frame_h = frame.rows() as u32;
+
+        if frame_w == 0 || frame_h == 0 {
+            return Ok(StageOutcome::Exhausted("empty frame (0×0)".into()));
+        }
+
+        let crop = self.crop_for_iteration(iteration, frame_w, frame_h);
+
+        // Validate the crop fits within the frame
+        if crop.x + crop.width > frame_w || crop.y + crop.height > frame_h {
+            return Ok(StageOutcome::Retry(format!(
+                "crop {}x{}+{}+{} exceeds frame {}x{}",
+                crop.width, crop.height, crop.x, crop.y, frame_w, frame_h
+            )));
+        }
+
+        if crop.width < 100 || crop.height < 50 {
+            return Ok(StageOutcome::Exhausted(
+                "crop region too small for meaningful detection".into(),
+            ));
+        }
+
+        // Extract the ROI — opencv::core::Mat::roi returns a sub-matrix view
+        let roi = Rect::new(
+            crop.x as i32,
+            crop.y as i32,
+            crop.width as i32,
+            crop.height as i32,
+        );
+        // Verify the ROI is valid by creating the sub-mat (this clones the data)
+        let _cropped = Mat::roi(frame, roi)?;
+
+        state.crop = Some(crop);
+        Ok(StageOutcome::Success)
+    }
+
+    fn max_retries(&self) -> u32 {
+        20 // 20 × 20px = 400px max expansion
+    }
+
+    fn debug_image(
+        &self,
+        state: &PipelineState,
+        frame: &Mat,
+    ) -> Result<Option<DebugImage>, opencv::Error> {
+        let Some(crop) = &state.crop else {
+            return Ok(None);
+        };
+
+        let mut canvas = frame.clone();
+        let rect = Rect::new(
+            crop.x as i32,
+            crop.y as i32,
+            crop.width as i32,
+            crop.height as i32,
+        );
+        // Draw green rectangle around crop region
+        imgproc::rectangle(
+            &mut canvas,
+            rect,
+            Scalar::new(0.0, 255.0, 0.0, 0.0),
+            2,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        let jpeg = encode_jpeg(&canvas, 80)?;
+        Ok(Some(("S1:FindStove".into(), jpeg)))
+    }
+}

@@ -6,5 +6,6 @@ pub mod debug_server;
 pub mod detect;
 pub mod led;
 pub mod mqtt;
+pub mod pipeline;
 pub mod preprocess;
 pub mod types;

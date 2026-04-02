@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM alpine:3.21 AS builder
 
 # Build deps: OpenCV headers, clang for bindgen, build tools
@@ -19,16 +20,28 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain stable --profile minimal
 
 WORKDIR /build
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY tests/ tests/
 
-RUN cargo build --release --bin oven-vision
+# --- Test stage: docker buildx build --target test . ---
+FROM builder AS test
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    cargo test
 
+# --- Release build ---
+FROM builder AS release
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    cargo build --release --bin oven-vision
+
+# --- Runtime ---
 FROM alpine:3.21
 
 RUN apk add --no-cache opencv libstdc++
 
-COPY --from=builder /build/target/release/oven-vision /usr/local/bin/oven-vision
+COPY --from=release /build/target/release/oven-vision /usr/local/bin/oven-vision
 
 EXPOSE 8080
 

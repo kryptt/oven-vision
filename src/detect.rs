@@ -3,6 +3,7 @@ use opencv::imgproc;
 use opencv::prelude::*;
 
 use crate::config::DialConfig;
+use crate::pipeline::stage::DetectedFeatures;
 
 /// Coarse heat level bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,20 @@ const CANNY_HIGH: f64 = 30.0;
 /// readings before flipping state.
 const HYSTERESIS_FRAMES: u32 = 3;
 
+/// Default dial labels in left-to-right order (matching the stove layout).
+const DEFAULT_LABELS: [&str; 10] = [
+    "oven_left_mode",
+    "burner_top_left",
+    "burner_bottom_left",
+    "oven_left_temp",
+    "burner_top_center",
+    "burner_bottom_center",
+    "burner_top_right",
+    "burner_bottom_right",
+    "oven_right_temp",
+    "oven_right_mode",
+];
+
 impl DialDetector {
     pub fn new(configs: Vec<DialConfig>) -> Self {
         let n = configs.len();
@@ -76,6 +91,41 @@ impl DialDetector {
             latest_angle: vec![None; n],
             latest_confidence: vec![0.0; n],
         }
+    }
+
+    /// Create a detector from pipeline-discovered features.
+    ///
+    /// Knob positions and radii come from the pipeline's `DetectedFeatures`.
+    /// Labels are taken from `labels` (if provided and long enough), falling
+    /// back to the hardcoded stove layout names, then generic "dial_N" names.
+    pub fn from_features(features: &DetectedFeatures, labels: Option<&[String]>) -> Self {
+        let configs: Vec<DialConfig> = features
+            .knobs
+            .iter()
+            .enumerate()
+            .map(|(i, knob)| {
+                let label = labels.and_then(|l| l.get(i)).cloned().unwrap_or_else(|| {
+                    DEFAULT_LABELS
+                        .get(i)
+                        .map(|s| (*s).to_string())
+                        .unwrap_or_else(|| format!("dial_{}", i + 1))
+                });
+                DialConfig {
+                    label,
+                    center_x: knob.center_x.round() as u32,
+                    center_y: knob.center_y.round() as u32,
+                    radius: knob.radius.round().max(1.0) as u32,
+                    off_angle_deg: features.off_angles.get(i).copied().unwrap_or(0.0),
+                    off_tolerance_deg: 25.0,
+                }
+            })
+            .collect();
+        Self::new(configs)
+    }
+
+    /// Access the underlying dial configs (useful for MQTT discovery).
+    pub fn configs(&self) -> &[DialConfig] {
+        &self.configs
     }
 
     /// Detect all dials in the preprocessed grayscale image.
@@ -234,11 +284,7 @@ pub fn radial_edge_scan(
 
 /// Classify a detected angle into a `DialState` based on the calibrated
 /// off-angle and tolerance.
-pub fn classify_dial(
-    angle_deg: f64,
-    off_angle_deg: f64,
-    off_tolerance_deg: f64,
-) -> DialState {
+pub fn classify_dial(angle_deg: f64, off_angle_deg: f64, off_tolerance_deg: f64) -> DialState {
     let diff = angular_distance(angle_deg, off_angle_deg);
 
     if diff.abs() <= off_tolerance_deg {
@@ -268,7 +314,6 @@ pub fn classify_dial(
 fn angular_distance(a: f64, b: f64) -> f64 {
     ((a - b) % 360.0 + 540.0) % 360.0 - 180.0
 }
-
 
 impl std::fmt::Display for HeatLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
