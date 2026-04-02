@@ -1,4 +1,5 @@
-use image::DynamicImage;
+use opencv::core::{Mat, Vec3b};
+use opencv::prelude::*;
 
 use crate::config::LedConfig;
 use crate::types::{LedReading, LedState};
@@ -40,55 +41,58 @@ pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
     (h, s, v)
 }
 
-/// Detect LED states from a color frame for each configured LED region.
-pub fn detect_leds(frame: &DynamicImage, led_configs: &[LedConfig]) -> Vec<LedReading> {
-    let rgb = frame.to_rgb8();
-    let (img_w, img_h) = (rgb.width(), rgb.height());
+/// Detect LED states from a BGR color frame for each configured LED region.
+pub fn detect_leds(frame: &Mat, led_configs: &[LedConfig]) -> Result<Vec<LedReading>, opencv::Error> {
+    let img_w = frame.cols() as u32;
+    let img_h = frame.rows() as u32;
 
-    led_configs
-        .iter()
-        .map(|cfg| {
-            let x_end = (cfg.x + cfg.width).min(img_w);
-            let y_end = (cfg.y + cfg.height).min(img_h);
+    let mut results = Vec::with_capacity(led_configs.len());
 
-            let mut sum_h_sin = 0.0f64;
-            let mut sum_h_cos = 0.0f64;
-            let mut sum_s = 0.0f64;
-            let mut sum_v = 0.0f64;
-            let mut count = 0u32;
+    for cfg in led_configs {
+        let x_end = (cfg.x + cfg.width).min(img_w);
+        let y_end = (cfg.y + cfg.height).min(img_h);
 
-            for py in cfg.y..y_end {
-                for px in cfg.x..x_end {
-                    let pixel = rgb.get_pixel(px, py);
-                    let (h, s, v) = rgb_to_hsv(pixel[0], pixel[1], pixel[2]);
-                    sum_h_sin += h.to_radians().sin();
-                    sum_h_cos += h.to_radians().cos();
-                    sum_s += s;
-                    sum_v += v;
-                    count += 1;
-                }
+        let mut sum_h_sin = 0.0f64;
+        let mut sum_h_cos = 0.0f64;
+        let mut sum_s = 0.0f64;
+        let mut sum_v = 0.0f64;
+        let mut count = 0u32;
+
+        for py in cfg.y..y_end {
+            for px in cfg.x..x_end {
+                let pixel = frame.at_2d::<Vec3b>(py as i32, px as i32)?;
+                // OpenCV is BGR — swap to RGB for rgb_to_hsv
+                let (h, s, v) = rgb_to_hsv(pixel[2], pixel[1], pixel[0]);
+                sum_h_sin += h.to_radians().sin();
+                sum_h_cos += h.to_radians().cos();
+                sum_s += s;
+                sum_v += v;
+                count += 1;
             }
+        }
 
-            if count == 0 {
-                return LedReading {
-                    label: cfg.label.clone(),
-                    state: LedState::Off,
-                };
-            }
-
-            let n = count as f64;
-            let mean_h = (sum_h_sin.atan2(sum_h_cos).to_degrees() + 360.0) % 360.0;
-            let mean_s = sum_s / n;
-            let mean_v = sum_v / n;
-
-            let state = classify_led(mean_h, mean_s, mean_v);
-
-            LedReading {
+        if count == 0 {
+            results.push(LedReading {
                 label: cfg.label.clone(),
-                state,
-            }
-        })
-        .collect()
+                state: LedState::Off,
+            });
+            continue;
+        }
+
+        let n = count as f64;
+        let mean_h = (sum_h_sin.atan2(sum_h_cos).to_degrees() + 360.0) % 360.0;
+        let mean_s = sum_s / n;
+        let mean_v = sum_v / n;
+
+        let state = classify_led(mean_h, mean_s, mean_v);
+
+        results.push(LedReading {
+            label: cfg.label.clone(),
+            state,
+        });
+    }
+
+    Ok(results)
 }
 
 /// Classify an LED state from mean HSV values.

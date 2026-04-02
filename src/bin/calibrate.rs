@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+use opencv::core::Vector;
+use opencv::imgcodecs;
+use opencv::prelude::*;
+
 use oven_vision::capture::fetch_frame;
 use oven_vision::config::{DialConfig, LedConfig};
 use oven_vision::detect::radial_edge_scan;
@@ -113,19 +117,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame = fetch_frame(&client, &args.url).await?;
     eprintln!(
         "Frame captured: {}x{} pixels",
-        frame.width(),
-        frame.height()
+        frame.cols(),
+        frame.rows()
     );
 
     // Save reference image
-    frame.save(&args.reference_path)?;
+    let ref_path = args.reference_path.to_str().unwrap_or("calibration_reference.jpg");
+    imgcodecs::imwrite(ref_path, &frame, &Vector::new())?;
     eprintln!("Reference image saved to {:?}", args.reference_path);
 
     // Preprocess for edge detection (no perspective correction in calibration)
-    let gray = preprocess(&frame);
+    let gray = preprocess(&frame)?;
 
     // Use Canny edge detection (same params as the detector)
-    let edges = imageproc::edges::canny(&gray, 10.0, 30.0);
+    let mut edges = opencv::core::Mat::default();
+    opencv::imgproc::canny(&gray, &mut edges, 10.0, 30.0, 3, false)?;
 
     // Detect angles for each default dial
     let dials = default_dials();
@@ -138,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut calibrated_dials = Vec::with_capacity(dials.len());
 
     for dial in &dials {
-        let (angle, strength) = radial_edge_scan(&edges, dial.center_x, dial.center_y, dial.radius);
+        let (angle, strength) = radial_edge_scan(&edges, dial.center_x, dial.center_y, dial.radius)?;
         eprintln!(
             "  {:16} => angle={:6.1} deg, strength={:.3}",
             dial.label, angle, strength

@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use image::DynamicImage;
+use opencv::core::Mat;
 use tracing::{debug, info, warn};
 
 use crate::annotate::encode_jpeg;
@@ -38,7 +38,7 @@ impl CaptureStore {
     /// skipped (no low-confidence reading or rate-limited).
     pub fn maybe_capture(
         &mut self,
-        annotated_frame: &DynamicImage,
+        annotated_frame: &Mat,
         readings: &[DialReading],
     ) -> Result<Option<PathBuf>, io::Error> {
         // Check if any reading is below the confidence threshold
@@ -72,7 +72,9 @@ impl CaptureStore {
         let filename = format_timestamp_filename(secs);
         let path = self.dir.join(filename);
 
-        let jpeg_bytes = encode_jpeg(annotated_frame, 85);
+        let jpeg_bytes = encode_jpeg(annotated_frame, 85).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("JPEG encode failed: {e}"))
+        })?;
         fs::write(&path, &jpeg_bytes)?;
 
         info!(path = %path.display(), bytes = jpeg_bytes.len(), "saved low-confidence capture");

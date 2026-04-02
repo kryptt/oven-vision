@@ -1,10 +1,12 @@
-use image::DynamicImage;
+use opencv::core::{Mat, Vector};
+use opencv::imgcodecs;
+use opencv::prelude::*;
 use std::fmt;
 
 #[derive(Debug)]
 pub enum CaptureError {
     Http(reqwest::Error),
-    Decode(image::ImageError),
+    Decode(opencv::Error),
 }
 
 impl fmt::Display for CaptureError {
@@ -28,7 +30,7 @@ impl std::error::Error for CaptureError {
 pub async fn fetch_frame(
     client: &reqwest::Client,
     url: &str,
-) -> Result<DynamicImage, CaptureError> {
+) -> Result<Mat, CaptureError> {
     let bytes = client
         .get(url)
         .send()
@@ -38,5 +40,6 @@ pub async fn fetch_frame(
         .await
         .map_err(CaptureError::Http)?;
 
-    image::load_from_memory(&bytes).map_err(CaptureError::Decode)
+    let buf = Vector::from_slice(&bytes);
+    imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(CaptureError::Decode)
 }

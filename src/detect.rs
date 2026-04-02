@@ -1,5 +1,6 @@
-use image::GrayImage;
-use imageproc::edges::canny;
+use opencv::core::Mat;
+use opencv::imgproc;
+use opencv::prelude::*;
 
 use crate::config::DialConfig;
 
@@ -56,8 +57,8 @@ const MIN_EDGE_STRENGTH: f64 = 0.05;
 const RADIAL_SAMPLES: u32 = 15;
 
 /// Canny edge detection thresholds.
-const CANNY_LOW: f32 = 10.0;
-const CANNY_HIGH: f32 = 30.0;
+const CANNY_LOW: f64 = 10.0;
+const CANNY_HIGH: f64 = 30.0;
 
 /// Number of consecutive frames required to confirm a state change.
 /// At 1 fps with 5s poll interval, this means ~15 seconds of consistent
@@ -80,13 +81,14 @@ impl DialDetector {
     /// Detect all dials in the preprocessed grayscale image.
     /// Uses hysteresis: state only changes after HYSTERESIS_FRAMES consecutive
     /// frames agree on a different state from the current confirmed state.
-    pub fn detect_all(&mut self, preprocessed: &GrayImage) -> Vec<DialReading> {
-        let edges = canny(preprocessed, CANNY_LOW, CANNY_HIGH);
+    pub fn detect_all(&mut self, preprocessed: &Mat) -> Result<Vec<DialReading>, opencv::Error> {
+        let mut edges = Mat::default();
+        imgproc::canny(preprocessed, &mut edges, CANNY_LOW, CANNY_HIGH, 3, false)?;
 
         let mut results = Vec::with_capacity(self.configs.len());
 
         for (i, cfg) in self.configs.iter().enumerate() {
-            let raw = detect_single(&edges, cfg);
+            let raw = detect_single(&edges, cfg)?;
 
             self.latest_angle[i] = raw.angle_deg;
             self.latest_confidence[i] = raw.confidence;
@@ -120,7 +122,7 @@ impl DialDetector {
             });
         }
 
-        results
+        Ok(results)
     }
 }
 
@@ -135,26 +137,26 @@ fn state_category(state: DialState) -> u8 {
 }
 
 /// Detect a single dial from the edge image and its configuration.
-fn detect_single(edges: &GrayImage, cfg: &DialConfig) -> DialReading {
-    let (angle, strength) = radial_edge_scan(edges, cfg.center_x, cfg.center_y, cfg.radius);
+fn detect_single(edges: &Mat, cfg: &DialConfig) -> Result<DialReading, opencv::Error> {
+    let (angle, strength) = radial_edge_scan(edges, cfg.center_x, cfg.center_y, cfg.radius)?;
 
     if strength < MIN_EDGE_STRENGTH {
-        return DialReading {
+        return Ok(DialReading {
             label: cfg.label.clone(),
             state: DialState::Unavailable,
             angle_deg: None,
             confidence: strength,
-        };
+        });
     }
 
     let state = classify_dial(angle, cfg.off_angle_deg, cfg.off_tolerance_deg);
 
-    DialReading {
+    Ok(DialReading {
         label: cfg.label.clone(),
         state,
         angle_deg: Some(angle),
         confidence: strength,
-    }
+    })
 }
 
 /// Core detection: scan radial lines on the edge image and find the angle
@@ -162,13 +164,15 @@ fn detect_single(edges: &GrayImage, cfg: &DialConfig) -> DialReading {
 ///
 /// Returns `(best_angle_degrees, max_normalized_strength)`.
 pub fn radial_edge_scan(
-    edges: &GrayImage,
+    edges: &Mat,
     cx: u32,
     cy: u32,
     radius: u32,
-) -> (f64, f64) {
-    let (w, h) = (edges.width(), edges.height());
-    let raw = edges.as_raw();
+) -> Result<(f64, f64), opencv::Error> {
+    let w = edges.cols() as u32;
+    let h = edges.rows() as u32;
+    let step = edges.step1(0)? as u32;
+    let data = edges.data_bytes()?;
 
     let mut profile = [0.0f64; 360];
 
@@ -189,8 +193,8 @@ pub fn radial_edge_scan(
             let py = (cy as f64 + r * sin_a).round() as i64;
 
             if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
-                let idx = (py as u32) * w + (px as u32);
-                sum += raw[idx as usize] as f64;
+                let idx = (py as u32) * step + (px as u32);
+                sum += data[idx as usize] as f64;
                 count += 1;
             }
         }
@@ -225,7 +229,7 @@ pub fn radial_edge_scan(
     // Normalize strength to 0.0-1.0 (edge pixels are 255 in Canny output)
     let normalized = best_val / 255.0;
 
-    (best_angle as f64, normalized)
+    Ok((best_angle as f64, normalized))
 }
 
 /// Classify a detected angle into a `DialState` based on the calibrated
@@ -292,7 +296,7 @@ impl std::fmt::Display for DialReading {
         match self.angle_deg {
             Some(angle) => write!(
                 f,
-                "{}: {} (angle={:.1}°, confidence={:.2})",
+                "{}: {} (angle={:.1}, confidence={:.2})",
                 self.label, self.state, angle, self.confidence
             ),
             None => write!(

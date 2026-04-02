@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use opencv::prelude::*;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -79,34 +80,64 @@ async fn main() {
     loop {
         match fetch_frame(&client, &cfg.go2rtc_url).await {
             Ok(frame) => {
-                let gray = preprocess(&frame);
+                let gray = match preprocess(&frame) {
+                    Ok(g) => g,
+                    Err(err) => {
+                        error!(%err, "preprocessing failed");
+                        continue;
+                    }
+                };
                 info!(
-                    width = gray.width(),
-                    height = gray.height(),
+                    width = gray.cols(),
+                    height = gray.rows(),
                     "frame captured and preprocessed"
                 );
 
-                let readings = detector.detect_all(&gray);
+                let readings = match detector.detect_all(&gray) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        error!(%err, "dial detection failed");
+                        continue;
+                    }
+                };
                 for reading in &readings {
                     info!(%reading, "dial reading");
                 }
 
-                let led_readings = detect_leds(&frame, &cfg.leds);
+                let led_readings = match detect_leds(&frame, &cfg.leds) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        error!(%err, "LED detection failed");
+                        continue;
+                    }
+                };
                 for led in &led_readings {
                     info!(label = %led.label, state = %led.state, "led reading");
                 }
 
                 // Build annotated debug frame
-                let annotated = annotate_frame(
+                let annotated = match annotate_frame(
                     &frame,
                     &readings,
                     &led_readings,
                     &cfg.dials,
                     &cfg.leds,
-                );
+                ) {
+                    Ok(a) => a,
+                    Err(err) => {
+                        error!(%err, "annotation failed");
+                        continue;
+                    }
+                };
 
                 // Build JPEG for debug frame
-                let jpeg = encode_jpeg(&annotated, 80);
+                let jpeg = match encode_jpeg(&annotated, 80) {
+                    Ok(j) => j,
+                    Err(err) => {
+                        error!(%err, "JPEG encoding failed");
+                        continue;
+                    }
+                };
 
                 // Update shared debug state
                 debug_state.update_frame(jpeg.clone());

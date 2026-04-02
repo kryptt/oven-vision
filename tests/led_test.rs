@@ -1,17 +1,20 @@
-use image::{DynamicImage, RgbImage};
+use opencv::core::{Mat, CV_8UC3};
+use opencv::prelude::*;
 
 use oven_vision::config::LedConfig;
 use oven_vision::led::{detect_leds, rgb_to_hsv};
 use oven_vision::types::LedState;
 
-fn make_solid_frame(r: u8, g: u8, b: u8, width: u32, height: u32) -> DynamicImage {
-    let mut img = RgbImage::new(width, height);
-    for pixel in img.pixels_mut() {
-        pixel[0] = r;
-        pixel[1] = g;
-        pixel[2] = b;
-    }
-    DynamicImage::ImageRgb8(img)
+/// Create a solid-color BGR Mat of the given dimensions.
+fn make_solid_frame(r: u8, g: u8, b: u8, width: u32, height: u32) -> Mat {
+    // OpenCV uses BGR ordering
+    Mat::new_rows_cols_with_default(
+        height as i32,
+        width as i32,
+        CV_8UC3,
+        opencv::core::Scalar::new(b as f64, g as f64, r as f64, 0.0),
+    )
+    .expect("failed to create test Mat")
 }
 
 fn led_config() -> LedConfig {
@@ -67,7 +70,7 @@ fn rgb_to_hsv_black() {
 fn classify_green_led_as_heating() {
     // Bright green: H~120, S=255, V=255
     let frame = make_solid_frame(0, 255, 0, 10, 10);
-    let readings = detect_leds(&frame, &[led_config()]);
+    let readings = detect_leds(&frame, &[led_config()]).unwrap();
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].state, LedState::Heating);
 }
@@ -76,7 +79,7 @@ fn classify_green_led_as_heating() {
 fn classify_orange_led_as_on() {
     // Orange: RGB (255, 140, 0) -> H~33
     let frame = make_solid_frame(255, 140, 0, 10, 10);
-    let readings = detect_leds(&frame, &[led_config()]);
+    let readings = detect_leds(&frame, &[led_config()]).unwrap();
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].state, LedState::On);
 }
@@ -85,7 +88,7 @@ fn classify_orange_led_as_on() {
 fn classify_dark_led_as_off() {
     // Very dark pixel
     let frame = make_solid_frame(5, 5, 5, 10, 10);
-    let readings = detect_leds(&frame, &[led_config()]);
+    let readings = detect_leds(&frame, &[led_config()]).unwrap();
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].state, LedState::Off);
 }
@@ -94,7 +97,7 @@ fn classify_dark_led_as_off() {
 fn classify_desaturated_bright_as_off() {
     // Bright but desaturated (grayish white)
     let frame = make_solid_frame(200, 200, 200, 10, 10);
-    let readings = detect_leds(&frame, &[led_config()]);
+    let readings = detect_leds(&frame, &[led_config()]).unwrap();
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].state, LedState::Off);
 }
