@@ -3,12 +3,10 @@ use std::io::Cursor;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::{draw_hollow_circle_mut, draw_hollow_rect_mut, draw_line_segment_mut};
-use imageproc::geometric_transformations::{Interpolation, warp_into};
 use imageproc::rect::Rect;
 
-use crate::config::{DialConfig, LedConfig, PerspectiveConfig};
+use crate::config::{DialConfig, LedConfig};
 use crate::detect::{DialReading, DialState, HeatLevel};
-use crate::preprocess::perspective_projection;
 use crate::types::{LedReading, LedState};
 
 /// Green for dial circles and "off" state.
@@ -28,44 +26,18 @@ const COLOR_CYAN: Rgba<u8> = Rgba([0, 255, 255, 255]);
 /// White for unavailable / neutral.
 const COLOR_WHITE: Rgba<u8> = Rgba([255, 255, 255, 255]);
 
-/// Apply the same perspective warp used in preprocessing to a color frame.
-///
-/// Returns a new `DynamicImage` of size `perspective.width x perspective.height`.
-pub fn apply_perspective(image: &DynamicImage, perspective: &PerspectiveConfig) -> DynamicImage {
-    let src = image.to_rgba8();
-    let projection = perspective_projection(perspective)
-        .expect("perspective control points are degenerate");
-    let mut out = RgbaImage::new(perspective.width, perspective.height);
-    warp_into(
-        &src,
-        &projection,
-        Interpolation::Bilinear,
-        Rgba([0, 0, 0, 255]),
-        &mut out,
-    );
-    DynamicImage::ImageRgba8(out)
-}
-
 /// Draw debug annotations onto a color frame.
 ///
 /// Draws dial circles, angle indicator lines, LED rectangles, and colored
 /// state markers. Uses shapes (not text) to keep the dependency footprint small.
-///
-/// When `perspective` is `Some`, the color frame is first warped so that the
-/// annotations align with the corrected ROI coordinates.
 pub fn annotate_frame(
     frame: &DynamicImage,
     dial_readings: &[DialReading],
     led_readings: &[LedReading],
     dial_configs: &[DialConfig],
     led_configs: &[LedConfig],
-    perspective: Option<&PerspectiveConfig>,
 ) -> DynamicImage {
-    let base = match perspective {
-        Some(pcfg) => apply_perspective(frame, pcfg),
-        None => frame.clone(),
-    };
-    let mut canvas: RgbaImage = base.to_rgba8();
+    let mut canvas: RgbaImage = frame.to_rgba8();
 
     // Annotate dials
     for (reading, cfg) in dial_readings.iter().zip(dial_configs.iter()) {

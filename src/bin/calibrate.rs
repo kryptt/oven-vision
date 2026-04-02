@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Reference image saved to {:?}", args.reference_path);
 
     // Preprocess for edge detection (no perspective correction in calibration)
-    let gray = preprocess(&frame, None);
+    let gray = preprocess(&frame);
 
     // Use Canny edge detection (same params as the detector)
     let edges = imageproc::edges::canny(&gray, 10.0, 30.0);
