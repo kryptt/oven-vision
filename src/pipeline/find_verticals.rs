@@ -294,10 +294,10 @@ fn refine_boundary_slope(
         15.0, // max line gap
     )?;
 
-    // Filter to positive-slope segments only (x increases as y increases,
-    // matching the known camera angle where vertical edges tilt right going down).
+    // Filter to negative-slope segments only (x decreases as y increases,
+    // matching the known camera angle where vertical edges tilt left going down).
     // Ensure the segment goes top-to-bottom by normalizing so y1 < y2.
-    let positive_slope: Vec<Vec4i> = lines
+    let negative_slope: Vec<Vec4i> = lines
         .iter()
         .map(|l| {
             if l[1] <= l[3] {
@@ -306,10 +306,10 @@ fn refine_boundary_slope(
                 Vec4i::from([l[2], l[3], l[0], l[1]]) // flip
             }
         })
-        .filter(|l| l[2] >= l[0]) // x2 >= x1 = positive slope (right-leaning)
+        .filter(|l| l[2] <= l[0]) // x2 <= x1 = negative slope (left-leaning)
         .collect();
 
-    if positive_slope.is_empty() {
+    if negative_slope.is_empty() {
         return Ok(Line {
             x1: center_x as f64,
             y1: 0.0,
@@ -320,8 +320,8 @@ fn refine_boundary_slope(
 
     // Pick the longest segment
     let mut best_len = 0.0f64;
-    let mut best_line = positive_slope[0];
-    for l in &positive_slope {
+    let mut best_line = negative_slope[0];
+    for l in &negative_slope {
         let dx = (l[2] - l[0]) as f64;
         let dy = (l[3] - l[1]) as f64;
         let len = (dx * dx + dy * dy).sqrt();

@@ -10,7 +10,7 @@ use crate::annotate::encode_jpeg;
 /// as a fraction of the inter-line distance. This ensures the knob row
 /// (which sits just below the bottom trim) is fully included.
 const BAND_PADDING_TOP: f64 = 0.3;
-const BAND_PADDING_BOTTOM: f64 = 4.0;
+const BAND_PADDING_BOTTOM: f64 = 3.0;
 
 /// Stage 6: Extract the horizontal band between the two chrome trim lines
 /// from the perspective-corrected image.

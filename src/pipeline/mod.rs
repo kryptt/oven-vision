@@ -268,7 +268,8 @@ impl Pipeline {
             // Current working image: top of stack, or raw frame if stack is empty
             let src = image_stack.last().unwrap_or(frame);
 
-            debug!(stage = label, iter, "running stage");
+            let debug_seq = self.debug_images.len();
+            debug!(stage = label, iter, seq = debug_seq, "running stage");
 
             let (outcome, img_out) = stage.run(&mut self.state, src, &mut dst_buf, frame, iter)?;
 
@@ -279,27 +280,33 @@ impl Pipeline {
                         image_stack.push(std::mem::take(&mut dst_buf));
                     }
 
-                    info!(stage = label, iter, "stage succeeded");
-
                     // Collect debug image
-                    if self.should_debug(stage_idx) {
+                    let img_seq = if self.should_debug(stage_idx) {
                         let working = image_stack.last().unwrap_or(frame);
                         if let Some(img) = stage.debug_image(&self.state, working, frame)? {
                             self.debug_images.push(img);
+                            Some(self.debug_images.len() - 1)
+                        } else {
+                            None
                         }
-                    }
+                    } else {
+                        None
+                    };
+
+                    info!(stage = label, iter, seq = debug_seq, img = ?img_seq, "stage succeeded");
 
                     stage_idx += 1;
                 }
 
                 StageOutcome::Retry(reason) => {
-                    debug!(stage = label, iter, %reason, "stage retry");
+                    debug!(stage = label, iter, seq = debug_seq, %reason, "stage retry");
                     iterations[stage_idx] += 1;
 
                     if iterations[stage_idx] >= stage.max_retries() {
                         warn!(
                             stage = label,
                             max = stage.max_retries(),
+                            seq = debug_seq,
                             "stage exhausted retries"
                         );
                         let fallback_target = self.resolve_fallback(stage_idx)?;
@@ -315,7 +322,7 @@ impl Pipeline {
                 }
 
                 StageOutcome::Exhausted(reason) => {
-                    warn!(stage = label, %reason, "stage exhausted");
+                    warn!(stage = label, seq = debug_seq, %reason, "stage exhausted");
                     let fallback_target = self.resolve_fallback(stage_idx)?;
                     self.apply_fallback(
                         &mut stage_idx,
