@@ -9,20 +9,23 @@ use super::{ImageOutput, Stage};
 
 /// Maximum allowed Y-deviation (pixels) between any knob center and the
 /// median knob Y. Strict — knobs are at the same manufactured height.
-const Y_TOLERANCE_PX: f64 = 6.0;
+/// Coarse pass tolerance — just good enough to locate features for
+/// the corner-based perspective refinement (S10-S11). The strict check
+/// is in S13 (FinalCheck) at 6px.
+const Y_TOLERANCE_PX: f64 = 25.0;
 
 /// Minimum X-gap (pixels) between consecutive knob centers. Knobs closer
 /// than this are likely duplicates or false positives.
-const MIN_X_GAP_PX: f64 = 30.0;
+const MIN_X_GAP_PX: f64 = 10.0;
 
 /// Maximum coefficient of variation of inter-knob X-gaps. The Boretti has
 /// 3 groups with wider gaps between groups (~1.5× within-group), so the CV
 /// should be moderate but not extreme. Reject if gaps are wildly uneven.
-const MAX_GAP_CV: f64 = 0.20;
+const MAX_GAP_CV: f64 = 0.50;
 
 /// Maximum allowed radius deviation: any knob radius must be within this
 /// factor of the median knob radius (e.g., 1.5 = between 0.67x and 1.5x median).
-const MAX_RADIUS_FACTOR: f64 = 1.1;
+const MAX_RADIUS_FACTOR: f64 = 2.0;
 
 /// Expected knob count (excluding the clock).
 const EXPECTED_KNOBS: usize = 10;

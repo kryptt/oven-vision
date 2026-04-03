@@ -1,11 +1,15 @@
 pub mod cache;
 pub mod extract_band;
+pub mod final_check;
+pub mod final_detect;
 pub mod find_clock;
+pub mod find_corner;
 pub mod find_features;
 pub mod find_lines;
 pub mod find_stove;
 pub mod find_verticals;
 pub mod perspective;
+pub mod refine_warp;
 pub mod sanity;
 pub mod stage;
 pub mod util;
@@ -703,6 +707,8 @@ mod tests {
                     clock_center_x: 0.0,
                     clock_center_y: 0.0,
                     clock_radius: 0.0,
+                    corner_x: None,
+                    corner_y: None,
                 });
             }),
             mock_success("FindClock", "S7:FindClock", Some("ExtractBand"), |s| {
@@ -733,7 +739,47 @@ mod tests {
             mock_success(
                 "SanityCheck",
                 "S9:SanityCheck",
-                Some("FindVerticals"),
+                Some("FindFeatures"),
+                |_s| {},
+            ),
+            mock_success("FindCorner", "S10:FindCorner", Some("FindFeatures"), |s| {
+                if let Some(ks) = s.knob_search.as_mut() {
+                    ks.corner_x = Some(700.0);
+                    ks.corner_y = Some(10.0);
+                }
+            }),
+            mock_success(
+                "RefineWarp",
+                "S11:RefineWarp",
+                Some("FindCorner"),
+                |_s| {},
+            ),
+            mock_success(
+                "FinalDetect",
+                "S12:FinalDetect",
+                Some("RefineWarp"),
+                |s| {
+                    s.features = Some(stage::DetectedFeatures {
+                        clock: stage::CircleFeature {
+                            center_x: 50.0,
+                            center_y: 100.0,
+                            radius: 25.0,
+                        },
+                        knobs: (0..10)
+                            .map(|i| stage::CircleFeature {
+                                center_x: 120.0 + i as f64 * 65.0,
+                                center_y: 100.0,
+                                radius: 12.0,
+                            })
+                            .collect(),
+                        off_angles: vec![90.0; 10],
+                    });
+                },
+            ),
+            mock_success(
+                "FinalCheck",
+                "S13:FinalCheck",
+                Some("FinalDetect"),
                 |s| {
                     s.validated = true;
                 },

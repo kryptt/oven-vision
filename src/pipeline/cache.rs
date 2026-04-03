@@ -178,6 +178,8 @@ mod tests {
                 clock_center_x: 50.0,
                 clock_center_y: 100.0,
                 clock_radius: 25.0,
+                corner_x: None,
+                corner_y: None,
             }),
             features: Some(DetectedFeatures {
                 clock: CircleFeature {

@@ -14,7 +14,10 @@ use oven_vision::detect::DialDetector;
 use oven_vision::led::detect_leds;
 use oven_vision::mqtt::MqttPublisher;
 use oven_vision::pipeline::extract_band::ExtractBand;
+use oven_vision::pipeline::final_check::FinalCheck;
+use oven_vision::pipeline::final_detect::FinalDetect;
 use oven_vision::pipeline::find_clock::FindClock;
+use oven_vision::pipeline::find_corner::FindCorner;
 use oven_vision::pipeline::find_features::FindFeatures;
 use oven_vision::pipeline::find_lines::FindLines;
 use oven_vision::pipeline::find_stove::FindStove;
@@ -22,6 +25,7 @@ use oven_vision::pipeline::find_verticals::FindVerticals;
 use oven_vision::pipeline::perspective::Perspective;
 use oven_vision::pipeline::sanity::{SanityCheck, quick_sanity_check};
 use oven_vision::pipeline::stage::CropRegion;
+use oven_vision::pipeline::refine_warp::RefineWarp;
 use oven_vision::pipeline::warp_check::WarpCheck;
 use oven_vision::pipeline::{self, Pipeline, PipelineError};
 use oven_vision::preprocess::preprocess;
@@ -385,6 +389,10 @@ fn build_pipeline(cfg: &Config) -> Pipeline {
         Box::new(FindClock::new()),
         Box::new(FindFeatures::new()),
         Box::new(SanityCheck::new()),
+        Box::new(FindCorner::new()),
+        Box::new(RefineWarp::new()),
+        Box::new(FinalDetect::new()),
+        Box::new(FinalCheck::new()),
     ];
 
     Pipeline::new(

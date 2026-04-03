@@ -97,6 +97,8 @@ impl Stage for ExtractBand {
             clock_center_x: 0.0,
             clock_center_y: 0.0,
             clock_radius: 0.0,
+            corner_x: None,
+            corner_y: None,
         });
 
         Ok((StageOutcome::Success, ImageOutput::Transformed))

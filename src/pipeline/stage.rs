@@ -57,6 +57,11 @@ pub struct KnobSearchArea {
     pub clock_center_x: f64,
     pub clock_center_y: f64,
     pub clock_radius: f64,
+    /// Top-right corner of the oven panel (set by FindCorner).
+    #[serde(default)]
+    pub corner_x: Option<f64>,
+    #[serde(default)]
+    pub corner_y: Option<f64>,
 }
 
 /// A detected circular feature (knob or clock).
