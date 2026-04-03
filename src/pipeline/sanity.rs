@@ -47,7 +47,7 @@ impl SanityCheck {
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     name: "SanityCheck",
     label: "S9:SanityCheck",
-    fallback: Some("FindVerticals"),
+    fallback: Some("FindFeatures"),
 };
 
 impl Stage for SanityCheck {
