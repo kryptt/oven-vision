@@ -2,25 +2,27 @@ use opencv::core::{Mat, Size, Vec3f, Vector};
 use opencv::imgproc;
 use opencv::prelude::*;
 
+use tracing::info;
+
 use super::stage::{PipelineState, StageDescriptor, StageOutcome};
 use super::{ImageOutput, Stage};
 
 /// Maximum allowed Y-deviation (pixels) between any knob center and the
 /// median knob Y. Strict — knobs are at the same manufactured height.
-const Y_TOLERANCE_PX: f64 = 8.0;
+const Y_TOLERANCE_PX: f64 = 6.0;
 
 /// Minimum X-gap (pixels) between consecutive knob centers. Knobs closer
 /// than this are likely duplicates or false positives.
-const MIN_X_GAP_PX: f64 = 15.0;
+const MIN_X_GAP_PX: f64 = 30.0;
 
 /// Maximum coefficient of variation of inter-knob X-gaps. The Boretti has
 /// 3 groups with wider gaps between groups (~1.5× within-group), so the CV
 /// should be moderate but not extreme. Reject if gaps are wildly uneven.
-const MAX_GAP_CV: f64 = 0.45;
+const MAX_GAP_CV: f64 = 0.20;
 
 /// Maximum allowed radius deviation: any knob radius must be within this
 /// factor of the median knob radius (e.g., 1.5 = between 0.67x and 1.5x median).
-const MAX_RADIUS_FACTOR: f64 = 1.5;
+const MAX_RADIUS_FACTOR: f64 = 1.1;
 
 /// Expected knob count (excluding the clock).
 const EXPECTED_KNOBS: usize = 10;
@@ -185,6 +187,53 @@ impl Stage for SanityCheck {
                 ));
             }
         }
+
+        // Log all measured values on success for threshold tuning
+        let max_y_dev = ys.iter().map(|y| (y - median_y).abs()).fold(0.0f64, f64::max);
+        let min_gap = {
+            let mut mg = f64::INFINITY;
+            for i in 1..features.knobs.len() {
+                let g = features.knobs[i].center_x - features.knobs[i - 1].center_x;
+                if g < mg { mg = g; }
+            }
+            mg
+        };
+        let min_pair_dist = {
+            let mut md = f64::INFINITY;
+            for i in 0..features.knobs.len() {
+                for j in (i + 1)..features.knobs.len() {
+                    let dx = features.knobs[j].center_x - features.knobs[i].center_x;
+                    let dy = features.knobs[j].center_y - features.knobs[i].center_y;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < md { md = d; }
+                }
+            }
+            md
+        };
+        // Recompute gap CV for logging
+        let gap_cv = {
+            let mut gaps: Vec<f64> = Vec::new();
+            for i in 1..features.knobs.len() {
+                gaps.push(features.knobs[i].center_x - features.knobs[i - 1].center_x);
+            }
+            let mean: f64 = gaps.iter().sum::<f64>() / gaps.len() as f64;
+            let var: f64 = gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / gaps.len() as f64;
+            var.sqrt() / mean.max(1.0)
+        };
+        let r_cv = {
+            let mean: f64 = radii.iter().sum::<f64>() / radii.len() as f64;
+            let var: f64 = radii.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / radii.len() as f64;
+            var.sqrt() / mean.max(1.0)
+        };
+        info!(
+            max_y_dev = format!("{max_y_dev:.1}"),
+            min_x_gap = format!("{min_gap:.1}"),
+            gap_cv = format!("{gap_cv:.2}"),
+            min_pair_dist = format!("{min_pair_dist:.1}"),
+            median_r = format!("{median_r:.1}"),
+            r_cv = format!("{r_cv:.2}"),
+            "S9 passed — measured values"
+        );
 
         state.validated = true;
         Ok((StageOutcome::Success, ImageOutput::Passthrough))
