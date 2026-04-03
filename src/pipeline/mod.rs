@@ -1,4 +1,6 @@
 pub mod cache;
+pub mod extract_band;
+pub mod find_clock;
 pub mod find_features;
 pub mod find_lines;
 pub mod find_stove;
@@ -8,15 +10,13 @@ pub mod sanity;
 pub mod stage;
 pub mod util;
 
-use std::path::Path;
-
 use opencv::core::{Mat, Rect, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
 use tracing::{debug, info, warn};
 
 use cache::PipelineCache;
-use stage::{PipelineState, StageId, StageOutcome};
+use stage::{PipelineState, StageDescriptor, StageOutcome};
 
 /// Per-stage debug image: (label, JPEG-encoded bytes).
 pub type DebugImage = (String, Vec<u8>);
@@ -28,7 +28,7 @@ pub type DebugImage = (String, Vec<u8>);
 /// The `iteration` parameter (0-based) tells the stage which parameter
 /// variation to try on retries.
 pub trait Stage {
-    fn id(&self) -> StageId;
+    fn descriptor(&self) -> StageDescriptor;
 
     /// Run one attempt of this stage.
     ///
@@ -78,37 +78,85 @@ pub struct PipelineConfig {
 ///
 /// Runs stages in order. On retry, re-runs the same stage with an incremented
 /// iteration counter. When a stage exhausts its retries, falls back to the
-/// stage indicated by `StageId::fallback()` and clears its iteration counter
+/// stage indicated by its `fallback` descriptor and clears its iteration counter
 /// so it can try different inputs.
 pub struct Pipeline {
     stages: Vec<Box<dyn Stage>>,
+    /// Resolved fallback index for each stage. `None` = no fallback (pipeline fails).
+    fallback_idx: Vec<Option<usize>>,
+    /// Cache version computed from stage descriptors.
+    cache_version: u64,
     pub state: PipelineState,
     pub debug_images: Vec<DebugImage>,
     config: PipelineConfig,
+    /// Comma-separated stage filters from DEBUG_STAGES env var.
+    /// Empty = all stages. "none" = no stages.
+    debug_filter: Vec<String>,
 }
 
 impl Pipeline {
     pub fn new(stages: Vec<Box<dyn Stage>>, config: PipelineConfig) -> Self {
-        // Verify stages are in order
-        for (i, stage) in stages.iter().enumerate() {
-            debug_assert_eq!(
-                stage.id().index(),
-                i,
-                "stages must be registered in StageId order"
-            );
-        }
+        // Build name-to-index map from stage descriptors
+        let name_to_idx: std::collections::HashMap<&str, usize> = stages
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.descriptor().name, i))
+            .collect();
+
+        // Resolve each stage's fallback name to an index
+        let fallback_idx: Vec<Option<usize>> = stages
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let desc = s.descriptor();
+                desc.fallback.map(|fb_name| {
+                    let idx = *name_to_idx.get(fb_name).unwrap_or_else(|| {
+                        panic!(
+                            "stage '{}' references unknown fallback '{}'",
+                            desc.name, fb_name
+                        )
+                    });
+                    assert!(
+                        idx < i,
+                        "stage '{}' fallback '{}' (idx {}) must precede it (idx {})",
+                        desc.name,
+                        fb_name,
+                        idx,
+                        i
+                    );
+                    idx
+                })
+            })
+            .collect();
+
+        let cache_version = cache::compute_cache_version(&stages);
+
+        let debug_filter = std::env::var("DEBUG_STAGES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         Self {
             stages,
+            fallback_idx,
+            cache_version,
             state: PipelineState::default(),
             debug_images: Vec::new(),
             config,
+            debug_filter,
         }
     }
 
     /// Try to load a cached pipeline state. Returns `true` if the cache was
     /// valid and loaded, `false` if calibration is needed.
     pub fn try_load_cache(&mut self, frame_width: u32, frame_height: u32) -> bool {
-        match PipelineCache::load(&self.config.cache_path, frame_width, frame_height) {
+        match PipelineCache::load(
+            &self.config.cache_path,
+            frame_width,
+            frame_height,
+            self.cache_version,
+        ) {
             Ok(state) => {
                 info!("loaded valid pipeline cache");
                 self.state = state;
@@ -179,19 +227,20 @@ impl Pipeline {
                 )));
             }
             let stage = &self.stages[stage_idx];
-            let sid = stage.id();
+            let label = stage.descriptor().label;
             let iter = iterations[stage_idx];
 
-            debug!(%sid, iter, "running stage");
+            debug!(stage = label, iter, "running stage");
 
             match stage.run(&mut self.state, frame, iter)? {
                 StageOutcome::Success => {
-                    info!(%sid, iter, "stage succeeded");
+                    info!(stage = label, iter, "stage succeeded");
 
-                    // Collect debug image — keep all images (don't replace),
-                    // so iterative stages produce a visual history.
-                    if let Some(img) = stage.debug_image(&self.state, frame)? {
-                        self.debug_images.push(img);
+                    // Collect debug image if this stage is in the DEBUG_STAGES filter.
+                    if self.should_debug(stage_idx) {
+                        if let Some(img) = stage.debug_image(&self.state, frame)? {
+                            self.debug_images.push(img);
+                        }
                     }
 
                     // Do NOT reset iterations[stage_idx] here — the counter
@@ -202,22 +251,26 @@ impl Pipeline {
                 }
 
                 StageOutcome::Retry(reason) => {
-                    debug!(%sid, iter, %reason, "stage retry");
+                    debug!(stage = label, iter, %reason, "stage retry");
                     iterations[stage_idx] += 1;
 
                     if iterations[stage_idx] >= stage.max_retries() {
                         // Exceeded max retries — treat as exhausted
-                        warn!(%sid, max = stage.max_retries(), "stage exhausted retries");
+                        warn!(
+                            stage = label,
+                            max = stage.max_retries(),
+                            "stage exhausted retries"
+                        );
                         self.handle_fallback(
                             &mut stage_idx,
                             &mut iterations,
-                            &format!("{sid} exhausted after {reason}"),
+                            &format!("{label} exhausted after {reason}"),
                         )?;
                     }
                 }
 
                 StageOutcome::Exhausted(reason) => {
-                    warn!(%sid, %reason, "stage exhausted");
+                    warn!(stage = label, %reason, "stage exhausted");
                     self.handle_fallback(&mut stage_idx, &mut iterations, &reason)?;
                 }
             }
@@ -239,34 +292,46 @@ impl Pipeline {
         iterations: &mut Vec<u32>,
         reason: &str,
     ) -> Result<(), PipelineError> {
-        let sid = self.stages[*stage_idx].id();
+        let label = self.stages[*stage_idx].descriptor().label;
 
-        match sid.fallback() {
-            Some(prev) => {
-                let prev_idx = prev.index();
+        match self.fallback_idx[*stage_idx] {
+            Some(prev_idx) => {
+                let prev_label = self.stages[prev_idx].descriptor().label;
                 iterations[*stage_idx] = 0; // reset current stage
                 iterations[prev_idx] += 1; // bump previous stage
 
                 if iterations[prev_idx] >= self.stages[prev_idx].max_retries() {
                     // Previous stage also exhausted — try its fallback
-                    warn!(%prev, "fallback stage also exhausted, cascading");
+                    warn!(
+                        stage = prev_label,
+                        "fallback stage also exhausted, cascading"
+                    );
                     *stage_idx = prev_idx;
                     return self.handle_fallback(stage_idx, iterations, reason);
                 }
 
-                info!(%sid, fallback = %prev, iter = iterations[prev_idx], "falling back");
+                info!(
+                    stage = label,
+                    fallback = prev_label,
+                    iter = iterations[prev_idx],
+                    "falling back"
+                );
                 *stage_idx = prev_idx;
                 Ok(())
             }
             None => Err(PipelineError::Exhausted(format!(
-                "{sid} exhausted with no fallback: {reason}"
+                "{label} exhausted with no fallback: {reason}"
             ))),
         }
     }
 
     fn save_cache(&self, frame: &Mat) -> Result<(), PipelineError> {
-        let cache =
-            PipelineCache::new(self.state.clone(), frame.cols() as u32, frame.rows() as u32);
+        let cache = PipelineCache::new(
+            self.state.clone(),
+            frame.cols() as u32,
+            frame.rows() as u32,
+            self.cache_version,
+        );
 
         if let Some(parent) = self.config.cache_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -277,6 +342,23 @@ impl Pipeline {
         cache
             .save(&self.config.cache_path)
             .map_err(|e| PipelineError::Cache(format!("failed to save cache: {e}")))
+    }
+
+    /// Check if a stage should produce debug images.
+    fn should_debug(&self, stage_idx: usize) -> bool {
+        if self.debug_filter.is_empty() {
+            return true; // no filter = all stages
+        }
+        if self.debug_filter.iter().any(|f| f == "none") {
+            return false;
+        }
+        if self.debug_filter.iter().any(|f| f == "all") {
+            return true;
+        }
+        let desc = self.stages[stage_idx].descriptor();
+        self.debug_filter
+            .iter()
+            .any(|f| desc.label.contains(f.as_str()) || f.eq_ignore_ascii_case(desc.name))
     }
 
     /// Get the current pipeline state (for detection mode).
@@ -360,12 +442,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A mock stage that succeeds on the first attempt.
-    struct SuccessStage(StageId);
+    /// A mock stage that always succeeds, populating state via a closure.
+    struct MockStage {
+        desc: StageDescriptor,
+        populate: fn(&mut PipelineState),
+        retries: u32,
+    }
 
-    impl Stage for SuccessStage {
-        fn id(&self) -> StageId {
-            self.0
+    impl Stage for MockStage {
+        fn descriptor(&self) -> StageDescriptor {
+            self.desc.clone()
         }
         fn run(
             &self,
@@ -373,34 +459,118 @@ mod tests {
             _frame: &Mat,
             _iteration: u32,
         ) -> Result<StageOutcome, opencv::Error> {
-            // Populate dummy state based on stage
-            match self.0 {
-                StageId::FindStove => {
-                    state.crop = Some(stage::CropRegion {
-                        x: 100,
-                        y: 200,
-                        width: 800,
-                        height: 300,
-                    });
-                }
-                StageId::FindLines => {
-                    state.lines = Some(stage::LinePair {
-                        top: stage::Line {
-                            x1: 0.0,
-                            y1: 10.0,
-                            x2: 800.0,
-                            y2: 5.0,
-                        },
-                        bottom: stage::Line {
-                            x1: 0.0,
-                            y1: 50.0,
-                            x2: 800.0,
-                            y2: 45.0,
-                        },
-                    });
-                }
-                StageId::FindVerticals => {
-                    state.verticals = Some(stage::VerticalPair {
+            (self.populate)(state);
+            Ok(StageOutcome::Success)
+        }
+        fn max_retries(&self) -> u32 {
+            self.retries
+        }
+    }
+
+    /// A stage that fails N times then succeeds.
+    struct FailNThenSucceed {
+        desc: StageDescriptor,
+        fail_count: u32,
+        attempts: AtomicU32,
+        populate: fn(&mut PipelineState),
+        retries: u32,
+    }
+
+    impl Stage for FailNThenSucceed {
+        fn descriptor(&self) -> StageDescriptor {
+            self.desc.clone()
+        }
+        fn run(
+            &self,
+            state: &mut PipelineState,
+            _frame: &Mat,
+            _iteration: u32,
+        ) -> Result<StageOutcome, opencv::Error> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_count {
+                Ok(StageOutcome::Retry(format!("attempt {n}")))
+            } else {
+                (self.populate)(state);
+                Ok(StageOutcome::Success)
+            }
+        }
+        fn max_retries(&self) -> u32 {
+            self.retries
+        }
+    }
+
+    /// A stage that always fails (exhausts retries).
+    struct AlwaysFailStage {
+        desc: StageDescriptor,
+        retries: u32,
+    }
+
+    impl Stage for AlwaysFailStage {
+        fn descriptor(&self) -> StageDescriptor {
+            self.desc.clone()
+        }
+        fn run(
+            &self,
+            _state: &mut PipelineState,
+            _frame: &Mat,
+            _iteration: u32,
+        ) -> Result<StageOutcome, opencv::Error> {
+            Ok(StageOutcome::Retry("always fails".into()))
+        }
+        fn max_retries(&self) -> u32 {
+            self.retries
+        }
+    }
+
+    fn mock_success(
+        name: &'static str,
+        label: &'static str,
+        fallback: Option<&'static str>,
+        populate: fn(&mut PipelineState),
+    ) -> Box<dyn Stage> {
+        Box::new(MockStage {
+            desc: StageDescriptor {
+                name,
+                label,
+                fallback,
+            },
+            populate,
+            retries: 3,
+        })
+    }
+
+    fn all_success_stages() -> Vec<Box<dyn Stage>> {
+        vec![
+            mock_success("FindStove", "S1:FindStove", None, |s| {
+                s.crop = Some(stage::CropRegion {
+                    x: 100,
+                    y: 200,
+                    width: 800,
+                    height: 300,
+                });
+            }),
+            mock_success("FindLines", "S2:FindLines", Some("FindStove"), |s| {
+                s.lines = Some(stage::LinePair {
+                    top: stage::Line {
+                        x1: 0.0,
+                        y1: 10.0,
+                        x2: 800.0,
+                        y2: 5.0,
+                    },
+                    bottom: stage::Line {
+                        x1: 0.0,
+                        y1: 50.0,
+                        x2: 800.0,
+                        y2: 45.0,
+                    },
+                });
+            }),
+            mock_success(
+                "FindVerticals",
+                "S2b:FindVerticals",
+                Some("FindLines"),
+                |s| {
+                    s.verticals = Some(stage::VerticalPair {
                         left: stage::Line {
                             x1: 10.0,
                             y1: 0.0,
@@ -414,9 +584,14 @@ mod tests {
                             y2: 300.0,
                         },
                     });
-                }
-                StageId::Perspective => {
-                    state.perspective = Some(stage::PerspectiveCorrection {
+                },
+            ),
+            mock_success(
+                "Perspective",
+                "S3:Perspective",
+                Some("FindVerticals"),
+                |s| {
+                    s.perspective = Some(stage::PerspectiveCorrection {
                         matrix: stage::TransformMatrix([
                             [1.0, 0.0, 0.0],
                             [0.0, 1.0, 0.0],
@@ -425,114 +600,61 @@ mod tests {
                         output_width: 800,
                         output_height: 200,
                     });
+                },
+            ),
+            mock_success("ExtractBand", "S3b:ExtractBand", Some("Perspective"), |s| {
+                s.knob_search = Some(stage::KnobSearchArea {
+                    y_min: 10.0,
+                    y_max: 190.0,
+                    x_min: 0.0,
+                    clock_center_x: 0.0,
+                    clock_center_y: 0.0,
+                    clock_radius: 0.0,
+                });
+            }),
+            mock_success("FindClock", "S3c:FindClock", Some("ExtractBand"), |s| {
+                if let Some(ks) = s.knob_search.as_mut() {
+                    ks.x_min = 80.0;
+                    ks.clock_center_x = 50.0;
+                    ks.clock_center_y = 100.0;
+                    ks.clock_radius = 25.0;
                 }
-                StageId::FindFeatures => {
-                    state.features = Some(stage::DetectedFeatures {
-                        clock: stage::CircleFeature {
-                            center_x: 50.0,
+            }),
+            mock_success("FindFeatures", "S4:FindFeatures", Some("FindClock"), |s| {
+                s.features = Some(stage::DetectedFeatures {
+                    clock: stage::CircleFeature {
+                        center_x: 50.0,
+                        center_y: 100.0,
+                        radius: 25.0,
+                    },
+                    knobs: (0..10)
+                        .map(|i| stage::CircleFeature {
+                            center_x: 120.0 + i as f64 * 65.0,
                             center_y: 100.0,
-                            radius: 25.0,
-                        },
-                        knobs: (0..10)
-                            .map(|i| stage::CircleFeature {
-                                center_x: 120.0 + i as f64 * 65.0,
-                                center_y: 100.0,
-                                radius: 12.0,
-                            })
-                            .collect(),
-                        off_angles: vec![90.0; 10],
-                    });
-                }
-                StageId::SanityCheck => {
-                    state.validated = true;
-                }
-            }
-            Ok(StageOutcome::Success)
-        }
-        fn max_retries(&self) -> u32 {
-            3
-        }
+                            radius: 12.0,
+                        })
+                        .collect(),
+                    off_angles: vec![90.0; 10],
+                });
+            }),
+            mock_success(
+                "SanityCheck",
+                "S5:SanityCheck",
+                Some("FindVerticals"),
+                |s| {
+                    s.validated = true;
+                },
+            ),
+        ]
     }
 
-    /// A stage that fails N times then succeeds.
-    struct FailThenSucceed {
-        id: StageId,
-        fail_count: u32,
-        attempts: AtomicU32,
-    }
-
-    impl FailThenSucceed {
-        fn new(id: StageId, fail_count: u32) -> Self {
-            Self {
-                id,
-                fail_count,
-                attempts: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl Stage for FailThenSucceed {
-        fn id(&self) -> StageId {
-            self.id
-        }
-        fn run(
-            &self,
-            state: &mut PipelineState,
-            _frame: &Mat,
-            _iteration: u32,
-        ) -> Result<StageOutcome, opencv::Error> {
-            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if n < self.fail_count {
-                Ok(StageOutcome::Retry(format!("attempt {n}")))
-            } else {
-                // Populate dummy state
-                match self.id {
-                    StageId::Perspective => {
-                        state.perspective = Some(stage::PerspectiveCorrection {
-                            matrix: stage::TransformMatrix([
-                                [1.0, 0.0, 0.0],
-                                [0.0, 1.0, 0.0],
-                                [0.0, 0.0, 1.0],
-                            ]),
-                            output_width: 800,
-                            output_height: 200,
-                        });
-                    }
-                    StageId::SanityCheck => {
-                        state.validated = true;
-                    }
-                    _ => {}
-                }
-                Ok(StageOutcome::Success)
-            }
-        }
-        fn max_retries(&self) -> u32 {
-            5
-        }
-    }
-
-    /// A stage that always exhausts retries.
-    struct AlwaysFail(StageId);
-
-    impl Stage for AlwaysFail {
-        fn id(&self) -> StageId {
-            self.0
-        }
-        fn run(
-            &self,
-            _state: &mut PipelineState,
-            _frame: &Mat,
-            _iteration: u32,
-        ) -> Result<StageOutcome, opencv::Error> {
-            Ok(StageOutcome::Retry("always fails".into()))
-        }
-        fn max_retries(&self) -> u32 {
-            2
-        }
+    /// Replace a stage at the given index in the stage list.
+    fn replace_stage(stages: &mut Vec<Box<dyn Stage>>, idx: usize, new_stage: Box<dyn Stage>) {
+        stages[idx] = new_stage;
     }
 
     fn dummy_frame() -> Mat {
-        // 4x4 black image — enough for mock stages that don't read pixels
+        // 4x4 black image -- enough for mock stages that don't read pixels
         Mat::zeros(4, 4, opencv::core::CV_8UC3)
             .unwrap()
             .to_mat()
@@ -549,14 +671,7 @@ mod tests {
 
     #[test]
     fn happy_path_all_stages_succeed() {
-        let stages: Vec<Box<dyn Stage>> = vec![
-            Box::new(SuccessStage(StageId::FindStove)),
-            Box::new(SuccessStage(StageId::FindLines)),
-            Box::new(SuccessStage(StageId::FindVerticals)),
-            Box::new(SuccessStage(StageId::Perspective)),
-            Box::new(SuccessStage(StageId::FindFeatures)),
-            Box::new(SuccessStage(StageId::SanityCheck)),
-        ];
+        let stages = all_success_stages();
         let mut pipeline = Pipeline::new(stages, test_config());
         let frame = dummy_frame();
 
@@ -571,14 +686,32 @@ mod tests {
 
     #[test]
     fn retry_stage_fails_twice_then_succeeds() {
-        let stages: Vec<Box<dyn Stage>> = vec![
-            Box::new(SuccessStage(StageId::FindStove)),
-            Box::new(SuccessStage(StageId::FindLines)),
-            Box::new(SuccessStage(StageId::FindVerticals)),
-            Box::new(FailThenSucceed::new(StageId::Perspective, 2)),
-            Box::new(SuccessStage(StageId::FindFeatures)),
-            Box::new(SuccessStage(StageId::SanityCheck)),
-        ];
+        let mut stages = all_success_stages();
+        replace_stage(
+            &mut stages,
+            3, // Perspective
+            Box::new(FailNThenSucceed {
+                desc: StageDescriptor {
+                    name: "Perspective",
+                    label: "S3:Perspective",
+                    fallback: Some("FindVerticals"),
+                },
+                fail_count: 2,
+                attempts: AtomicU32::new(0),
+                populate: |s| {
+                    s.perspective = Some(stage::PerspectiveCorrection {
+                        matrix: stage::TransformMatrix([
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ]),
+                        output_width: 800,
+                        output_height: 200,
+                    });
+                },
+                retries: 5,
+            }),
+        );
         let mut pipeline = Pipeline::new(stages, test_config());
         let frame = dummy_frame();
 
@@ -588,19 +721,34 @@ mod tests {
 
     #[test]
     fn fallback_stage3_exhausted_retries_stage2() {
-        // Stage 3 (Perspective) always fails → falls back to Stage 2
-        // Stage 2 will be re-run and Stage 3 will eventually succeed
-        // Use a counter to make Stage 3 succeed after Stage 2 re-runs
-        let stages: Vec<Box<dyn Stage>> = vec![
-            Box::new(SuccessStage(StageId::FindStove)),
-            Box::new(SuccessStage(StageId::FindLines)),
-            Box::new(SuccessStage(StageId::FindVerticals)),
-            // Fails 3 times then succeeds (max_retries=5, so after fallback
-            // resets counter it will succeed on the next round)
-            Box::new(FailThenSucceed::new(StageId::Perspective, 3)),
-            Box::new(SuccessStage(StageId::FindFeatures)),
-            Box::new(SuccessStage(StageId::SanityCheck)),
-        ];
+        // Stage 3 (Perspective) fails 3 times then succeeds
+        // Falls back to FindVerticals which re-runs, then Perspective succeeds
+        let mut stages = all_success_stages();
+        replace_stage(
+            &mut stages,
+            3, // Perspective
+            Box::new(FailNThenSucceed {
+                desc: StageDescriptor {
+                    name: "Perspective",
+                    label: "S3:Perspective",
+                    fallback: Some("FindVerticals"),
+                },
+                fail_count: 3,
+                attempts: AtomicU32::new(0),
+                populate: |s| {
+                    s.perspective = Some(stage::PerspectiveCorrection {
+                        matrix: stage::TransformMatrix([
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ]),
+                        output_width: 800,
+                        output_height: 200,
+                    });
+                },
+                retries: 5,
+            }),
+        );
         let mut pipeline = Pipeline::new(stages, test_config());
         let frame = dummy_frame();
 
@@ -610,15 +758,20 @@ mod tests {
 
     #[test]
     fn pipeline_exhausted_returns_error() {
-        // Stage 1 always fails → no fallback → pipeline error
-        let stages: Vec<Box<dyn Stage>> = vec![
-            Box::new(AlwaysFail(StageId::FindStove)),
-            Box::new(SuccessStage(StageId::FindLines)),
-            Box::new(SuccessStage(StageId::FindVerticals)),
-            Box::new(SuccessStage(StageId::Perspective)),
-            Box::new(SuccessStage(StageId::FindFeatures)),
-            Box::new(SuccessStage(StageId::SanityCheck)),
-        ];
+        // Stage 1 always fails, no fallback -> pipeline error
+        let mut stages = all_success_stages();
+        replace_stage(
+            &mut stages,
+            0, // FindStove
+            Box::new(AlwaysFailStage {
+                desc: StageDescriptor {
+                    name: "FindStove",
+                    label: "S1:FindStove",
+                    fallback: None,
+                },
+                retries: 2,
+            }),
+        );
         let mut pipeline = Pipeline::new(stages, test_config());
         let frame = dummy_frame();
 
@@ -631,14 +784,7 @@ mod tests {
         let config = test_config();
         let cache_path = config.cache_path.clone();
 
-        let stages: Vec<Box<dyn Stage>> = vec![
-            Box::new(SuccessStage(StageId::FindStove)),
-            Box::new(SuccessStage(StageId::FindLines)),
-            Box::new(SuccessStage(StageId::FindVerticals)),
-            Box::new(SuccessStage(StageId::Perspective)),
-            Box::new(SuccessStage(StageId::FindFeatures)),
-            Box::new(SuccessStage(StageId::SanityCheck)),
-        ];
+        let stages = all_success_stages();
         let mut pipeline = Pipeline::new(stages, config);
         let frame = dummy_frame();
 
@@ -655,14 +801,7 @@ mod tests {
         let cache_path = config.cache_path.clone();
 
         // First run: calibrate and save cache
-        let stages: Vec<Box<dyn Stage>> = vec![
-            Box::new(SuccessStage(StageId::FindStove)),
-            Box::new(SuccessStage(StageId::FindLines)),
-            Box::new(SuccessStage(StageId::FindVerticals)),
-            Box::new(SuccessStage(StageId::Perspective)),
-            Box::new(SuccessStage(StageId::FindFeatures)),
-            Box::new(SuccessStage(StageId::SanityCheck)),
-        ];
+        let stages = all_success_stages();
         let config1 = PipelineConfig {
             cache_path: cache_path.clone(),
             max_frame_attempts: 3,
@@ -672,14 +811,7 @@ mod tests {
         pipeline.calibrate(&frame).unwrap();
 
         // Second run: load from cache
-        let stages2: Vec<Box<dyn Stage>> = vec![
-            Box::new(SuccessStage(StageId::FindStove)),
-            Box::new(SuccessStage(StageId::FindLines)),
-            Box::new(SuccessStage(StageId::FindVerticals)),
-            Box::new(SuccessStage(StageId::Perspective)),
-            Box::new(SuccessStage(StageId::FindFeatures)),
-            Box::new(SuccessStage(StageId::SanityCheck)),
-        ];
+        let stages2 = all_success_stages();
         let config2 = PipelineConfig {
             cache_path: cache_path.clone(),
             max_frame_attempts: 3,

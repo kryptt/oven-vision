@@ -2,7 +2,7 @@ use opencv::core::{Mat, Rect, Scalar};
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use super::stage::{CropRegion, PipelineState, StageId, StageOutcome};
+use super::stage::{CropRegion, PipelineState, StageDescriptor, StageOutcome};
 use super::{DebugImage, Stage};
 use crate::annotate::encode_jpeg;
 
@@ -56,9 +56,15 @@ impl FindStove {
     }
 }
 
+pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
+    name: "FindStove",
+    label: "S1:FindStove",
+    fallback: None,
+};
+
 impl Stage for FindStove {
-    fn id(&self) -> StageId {
-        StageId::FindStove
+    fn descriptor(&self) -> StageDescriptor {
+        DESCRIPTOR
     }
 
     fn run(

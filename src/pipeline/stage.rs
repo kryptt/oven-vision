@@ -44,6 +44,21 @@ pub struct PerspectiveCorrection {
     pub output_height: u32,
 }
 
+/// The search area for knob detection, computed from the band + clock stages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnobSearchArea {
+    /// Top of the knob band in warped-image Y coordinates.
+    pub y_min: f64,
+    /// Bottom of the knob band in warped-image Y coordinates.
+    pub y_max: f64,
+    /// Left edge of the knob area (right side of the clock).
+    pub x_min: f64,
+    /// Clock center position in warped-image coordinates.
+    pub clock_center_x: f64,
+    pub clock_center_y: f64,
+    pub clock_radius: f64,
+}
+
 /// A detected circular feature (knob or clock).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CircleFeature {
@@ -68,55 +83,21 @@ pub struct PipelineState {
     pub lines: Option<LinePair>,
     pub verticals: Option<VerticalPair>,
     pub perspective: Option<PerspectiveCorrection>,
+    pub knob_search: Option<KnobSearchArea>,
     pub features: Option<DetectedFeatures>,
     /// Set to true after the sanity check stage passes.
     pub validated: bool,
 }
 
-/// The 6 pipeline stages, in execution order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum StageId {
-    FindStove = 0,
-    FindLines = 1,
-    FindVerticals = 2,
-    Perspective = 3,
-    FindFeatures = 4,
-    SanityCheck = 5,
-}
-
-impl StageId {
-    /// The previous stage to fall back to, if any.
-    pub fn fallback(self) -> Option<StageId> {
-        match self {
-            StageId::FindStove => None,
-            StageId::FindLines => Some(StageId::FindStove),
-            StageId::FindVerticals => Some(StageId::FindLines),
-            StageId::Perspective => Some(StageId::FindVerticals),
-            StageId::FindFeatures => Some(StageId::Perspective),
-            // SanityCheck failures (Y-deviation, X-gap) indicate a perspective
-            // or vertical selection problem, not a circle detection problem.
-            // Fall back to FindVerticals so a different pair is tried.
-            StageId::SanityCheck => Some(StageId::FindVerticals),
-        }
-    }
-
-    /// Numeric index of this stage (matches enum discriminant).
-    pub fn index(self) -> usize {
-        self as usize
-    }
-}
-
-impl std::fmt::Display for StageId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StageId::FindStove => write!(f, "S1:FindStove"),
-            StageId::FindLines => write!(f, "S2:FindLines"),
-            StageId::FindVerticals => write!(f, "S2b:FindVerticals"),
-            StageId::Perspective => write!(f, "S3:Perspective"),
-            StageId::FindFeatures => write!(f, "S4:FindFeatures"),
-            StageId::SanityCheck => write!(f, "S5:SanityCheck"),
-        }
-    }
+/// Metadata that each stage declares about itself.
+#[derive(Debug, Clone, Copy)]
+pub struct StageDescriptor {
+    /// Unique name, e.g. "FindStove". Used for cache hashing and fallback resolution.
+    pub name: &'static str,
+    /// Display label, e.g. "S1:FindStove". Used in logs and debug image filenames.
+    pub label: &'static str,
+    /// Name of the stage to fall back to on exhaustion. None = pipeline fails.
+    pub fallback: Option<&'static str>,
 }
 
 /// Outcome of running a single stage attempt.

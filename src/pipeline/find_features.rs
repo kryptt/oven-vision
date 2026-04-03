@@ -6,7 +6,7 @@ use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::perspective::transform_to_mat;
-use super::stage::{CircleFeature, DetectedFeatures, PipelineState, StageId, StageOutcome};
+use super::stage::{CircleFeature, DetectedFeatures, PipelineState, StageDescriptor, StageOutcome};
 use super::{DebugImage, Stage};
 use crate::annotate::encode_jpeg;
 
@@ -60,9 +60,15 @@ impl FindFeatures {
     }
 }
 
+pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
+    name: "FindFeatures",
+    label: "S4:FindFeatures",
+    fallback: Some("FindClock"),
+};
+
 impl Stage for FindFeatures {
-    fn id(&self) -> StageId {
-        StageId::FindFeatures
+    fn descriptor(&self) -> StageDescriptor {
+        DESCRIPTOR
     }
 
     fn run(
@@ -99,14 +105,15 @@ impl Stage for FindFeatures {
             Size::new(persp.output_width as i32, persp.output_height as i32),
         )?;
 
-        // Compute the Y-band where knobs should be.
-        // The warped image height is top_pad + inter_line + bot_pad.
-        // The trim lines are at Y=top_pad and Y=top_pad+inter_line.
-        // From the Boretti reference, knobs are at ~15-35% of image height
-        // (between the bottom trim and partway to the oven doors).
-        let img_h = persp.output_height as f64;
-        let knob_y_min = img_h * 0.10;
-        let knob_y_max = img_h * 0.45;
+        // Use the knob search area from ExtractBand + FindClock stages
+        let (knob_y_min, knob_y_max, knob_x_min) = match &state.knob_search {
+            Some(ks) => (ks.y_min, ks.y_max, ks.x_min),
+            None => {
+                // Fallback if stages didn't run
+                let img_h = persp.output_height as f64;
+                (img_h * 0.10, img_h * 0.45, 0.0)
+            }
+        };
 
         // Convert to grayscale
         let mut gray = Mat::default();
@@ -116,6 +123,12 @@ impl Stage for FindFeatures {
         let mut enhanced = Mat::default();
         let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
         clahe.apply(&gray, &mut enhanced)?;
+
+        // Color-invert: chrome knobs on dark panel → dark knobs on bright panel.
+        // This makes the knob ring a strong dark feature that template-matches better
+        // against the inverted reference photo.
+        let mut inverted = Mat::default();
+        opencv::core::bitwise_not(&enhanced, &mut inverted, &Mat::default())?;
 
         // Pick scale based on iteration (cycle through scales, then repeat with lower threshold)
         let scale_idx = (iteration as usize) % SCALE_FACTORS.len();
@@ -131,28 +144,30 @@ impl Stage for FindFeatures {
             )));
         }
 
-        // Enhance template contrast to match
+        // Enhance + invert the template to match the inverted image
         let mut knob_enhanced = Mat::default();
         clahe.apply(&scaled_knob, &mut knob_enhanced)?;
+        let mut knob_inv = Mat::default();
+        opencv::core::bitwise_not(&knob_enhanced, &mut knob_inv, &Mat::default())?;
 
         let mut all_knob_matches: Vec<TemplateMatch> = Vec::new();
 
         let n_rotations = (360.0 / ROTATION_STEP_DEG) as i32;
         for rot_idx in 0..n_rotations {
             let angle = rot_idx as f64 * ROTATION_STEP_DEG;
-            let rotated = rotate_template(&knob_enhanced, angle)?;
+            let rotated = rotate_template(&knob_inv, angle)?;
             if rotated.empty() {
                 continue;
             }
 
             // Skip if template is larger than image
-            if rotated.cols() >= enhanced.cols() || rotated.rows() >= enhanced.rows() {
+            if rotated.cols() >= inverted.cols() || rotated.rows() >= inverted.rows() {
                 continue;
             }
 
             let mut result = Mat::default();
             imgproc::match_template(
-                &enhanced,
+                &inverted,
                 &rotated,
                 &mut result,
                 imgproc::TM_CCOEFF_NORMED,
@@ -164,8 +179,8 @@ impl Stage for FindFeatures {
             all_knob_matches.extend(matches);
         }
 
-        // Filter to Y-band where knobs should be
-        all_knob_matches.retain(|m| m.y >= knob_y_min && m.y <= knob_y_max);
+        // Filter to knob search area (Y-band + right of clock)
+        all_knob_matches.retain(|m| m.y >= knob_y_min && m.y <= knob_y_max && m.x >= knob_x_min);
 
         if all_knob_matches.len() < EXPECTED_KNOBS {
             return Ok(StageOutcome::Retry(format!(
@@ -192,16 +207,18 @@ impl Stage for FindFeatures {
 
         if scaled_clock.cols() >= 5
             && scaled_clock.rows() >= 5
-            && scaled_clock.cols() < enhanced.cols()
-            && scaled_clock.rows() < enhanced.rows()
+            && scaled_clock.cols() < inverted.cols()
+            && scaled_clock.rows() < inverted.rows()
         {
             let mut clock_enhanced = Mat::default();
             clahe.apply(&scaled_clock, &mut clock_enhanced)?;
+            let mut clock_inv = Mat::default();
+            opencv::core::bitwise_not(&clock_enhanced, &mut clock_inv, &Mat::default())?;
 
             let mut result = Mat::default();
             imgproc::match_template(
-                &enhanced,
-                &clock_enhanced,
+                &inverted,
+                &clock_inv,
                 &mut result,
                 imgproc::TM_CCOEFF_NORMED,
                 &Mat::default(),

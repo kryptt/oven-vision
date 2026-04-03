@@ -13,6 +13,8 @@ use oven_vision::debug_server::{DebugState, run_debug_server};
 use oven_vision::detect::DialDetector;
 use oven_vision::led::detect_leds;
 use oven_vision::mqtt::MqttPublisher;
+use oven_vision::pipeline::extract_band::ExtractBand;
+use oven_vision::pipeline::find_clock::FindClock;
 use oven_vision::pipeline::find_features::FindFeatures;
 use oven_vision::pipeline::find_lines::FindLines;
 use oven_vision::pipeline::find_stove::FindStove;
@@ -230,6 +232,30 @@ async fn main() {
                     info!(%reading, "dial reading");
                 }
 
+                // Save runtime debug frames for the first 10 frames, then exit.
+                // This allows visual inspection of the detection results.
+                if frame_count < 10 {
+                    let runtime_path =
+                        capture_dir.join(format!("runtime_frame_{:02}.jpg", frame_count));
+                    // Draw detections on the warped image
+                    if let Ok(annotated) =
+                        annotate_frame(&warped, &readings, &[], detector.configs(), &[])
+                    {
+                        if let Ok(jpeg) = encode_jpeg(&annotated, 80) {
+                            if let Err(err) = std::fs::write(&runtime_path, &jpeg) {
+                                warn!(%err, "failed to save runtime frame");
+                            } else {
+                                info!(path = %runtime_path.display(), "saved runtime frame");
+                            }
+                        }
+                    }
+                }
+                if frame_count == 10 {
+                    info!("10 runtime frames captured, exiting for evaluation");
+                    save_calibration_debug_images(&pipe, &capture_dir);
+                    std::process::exit(0);
+                }
+
                 // LED detection runs on the raw (unwarped) frame
                 let led_readings = match detect_leds(&frame, &cfg.leds) {
                     Ok(r) => r,
@@ -353,6 +379,8 @@ fn build_pipeline(cfg: &Config) -> Pipeline {
         Box::new(FindLines::new()),
         Box::new(FindVerticals::new()),
         Box::new(Perspective::new()),
+        Box::new(ExtractBand::new()),
+        Box::new(FindClock::new()),
         Box::new(FindFeatures::new()),
         Box::new(SanityCheck::new()),
     ];

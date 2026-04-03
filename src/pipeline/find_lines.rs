@@ -4,7 +4,7 @@ use opencv::core::{Mat, Rect, Scalar, Size, Vec2f, Vector};
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use super::stage::{Line, LinePair, PipelineState, StageId, StageOutcome};
+use super::stage::{Line, LinePair, PipelineState, StageDescriptor, StageOutcome};
 use super::util::{cluster_average, cluster_by_rho, draw_line};
 use super::{DebugImage, Stage};
 use crate::annotate::encode_jpeg;
@@ -48,9 +48,15 @@ impl FindLines {
     }
 }
 
+pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
+    name: "FindLines",
+    label: "S2:FindLines",
+    fallback: Some("FindStove"),
+};
+
 impl Stage for FindLines {
-    fn id(&self) -> StageId {
-        StageId::FindLines
+    fn descriptor(&self) -> StageDescriptor {
+        DESCRIPTOR
     }
 
     fn run(
@@ -76,9 +82,21 @@ impl Stage for FindLines {
         let mut gray = Mat::default();
         imgproc::cvt_color_def(&cropped, &mut gray, imgproc::COLOR_BGR2GRAY)?;
 
+        // Blur before edge detection to reduce noise from chrome reflections.
+        // This helps find clean horizontal lines rather than fragmented edges.
+        let mut blurred = Mat::default();
+        imgproc::gaussian_blur(
+            &gray,
+            &mut blurred,
+            Size::new(5, 5),
+            1.5,
+            1.5,
+            opencv::core::BORDER_DEFAULT,
+        )?;
+
         let mut enhanced = Mat::default();
         let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
-        clahe.apply(&gray, &mut enhanced)?;
+        clahe.apply(&blurred, &mut enhanced)?;
 
         let (canny_low, canny_high, hough_threshold) = Self::thresholds_for_iteration(iteration);
 

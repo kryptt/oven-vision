@@ -3,7 +3,7 @@ use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{
-    Line, PerspectiveCorrection, PipelineState, StageId, StageOutcome, TransformMatrix,
+    Line, PerspectiveCorrection, PipelineState, StageDescriptor, StageOutcome, TransformMatrix,
 };
 use super::{DebugImage, Stage};
 use crate::annotate::encode_jpeg;
@@ -38,9 +38,15 @@ impl Perspective {
     }
 }
 
+pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
+    name: "Perspective",
+    label: "S3:Perspective",
+    fallback: Some("FindVerticals"),
+};
+
 impl Stage for Perspective {
-    fn id(&self) -> StageId {
-        StageId::Perspective
+    fn descriptor(&self) -> StageDescriptor {
+        DESCRIPTOR
     }
 
     fn run(

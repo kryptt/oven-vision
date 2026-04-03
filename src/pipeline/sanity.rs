@@ -6,7 +6,7 @@ use opencv::prelude::*;
 
 use super::Stage;
 use super::perspective::transform_to_mat;
-use super::stage::{PipelineState, StageId, StageOutcome};
+use super::stage::{PipelineState, StageDescriptor, StageOutcome};
 
 /// Maximum allowed Y-deviation (pixels) between any knob center and the
 /// median knob Y. If any knob exceeds this, perspective correction is off.
@@ -42,9 +42,15 @@ impl SanityCheck {
     }
 }
 
+pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
+    name: "SanityCheck",
+    label: "S5:SanityCheck",
+    fallback: Some("FindVerticals"),
+};
+
 impl Stage for SanityCheck {
-    fn id(&self) -> StageId {
-        StageId::SanityCheck
+    fn descriptor(&self) -> StageDescriptor {
+        DESCRIPTOR
     }
 
     fn run(

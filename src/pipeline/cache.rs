@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
 
@@ -5,14 +7,23 @@ use serde::{Deserialize, Serialize};
 
 use super::stage::PipelineState;
 
-/// Current cache format version. Bump when the schema changes to force
-/// re-calibration after a code update.
-const CACHE_VERSION: u32 = 2;
+/// Schema version -- bump when PipelineState fields change.
+const STATE_SCHEMA_VERSION: u32 = 1;
+
+/// Compute a cache version from the ordered stage names and schema version.
+pub fn compute_cache_version(stages: &[Box<dyn super::Stage>]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for s in stages {
+        s.descriptor().name.hash(&mut hasher);
+    }
+    STATE_SCHEMA_VERSION.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Wrapper that adds versioning around the serialized pipeline state.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PipelineCache {
-    pub version: u32,
+    pub version: u64,
     /// Frame dimensions at calibration time — mismatch invalidates the cache.
     pub frame_width: u32,
     pub frame_height: u32,
@@ -24,8 +35,8 @@ pub enum CacheError {
     Io(io::Error),
     Json(serde_json::Error),
     VersionMismatch {
-        on_disk: u32,
-        expected: u32,
+        on_disk: u64,
+        expected: u64,
     },
     FrameSizeMismatch {
         cached: (u32, u32),
@@ -61,9 +72,9 @@ impl std::error::Error for CacheError {}
 
 impl PipelineCache {
     /// Create a new cache entry from a validated pipeline state.
-    pub fn new(state: PipelineState, frame_width: u32, frame_height: u32) -> Self {
+    pub fn new(state: PipelineState, frame_width: u32, frame_height: u32, version: u64) -> Self {
         Self {
-            version: CACHE_VERSION,
+            version,
             frame_width,
             frame_height,
             state,
@@ -83,14 +94,15 @@ impl PipelineCache {
         path: &Path,
         current_width: u32,
         current_height: u32,
+        expected_version: u64,
     ) -> Result<PipelineState, CacheError> {
         let json = std::fs::read_to_string(path).map_err(CacheError::Io)?;
         let cache: PipelineCache = serde_json::from_str(&json).map_err(CacheError::Json)?;
 
-        if cache.version != CACHE_VERSION {
+        if cache.version != expected_version {
             return Err(CacheError::VersionMismatch {
                 on_disk: cache.version,
-                expected: CACHE_VERSION,
+                expected: expected_version,
             });
         }
 
@@ -115,6 +127,8 @@ mod tests {
     use crate::pipeline::stage::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    const TEST_VERSION: u64 = 42;
 
     fn sample_state() -> PipelineState {
         PipelineState {
@@ -157,6 +171,14 @@ mod tests {
                 output_width: 800,
                 output_height: 200,
             }),
+            knob_search: Some(KnobSearchArea {
+                y_min: 10.0,
+                y_max: 190.0,
+                x_min: 80.0,
+                clock_center_x: 50.0,
+                clock_center_y: 100.0,
+                clock_radius: 25.0,
+            }),
             features: Some(DetectedFeatures {
                 clock: CircleFeature {
                     center_x: 50.0,
@@ -182,10 +204,10 @@ mod tests {
         let path = tmp.path().to_owned();
 
         let state = sample_state();
-        let cache = PipelineCache::new(state.clone(), 2560, 1440);
+        let cache = PipelineCache::new(state.clone(), 2560, 1440, TEST_VERSION);
         cache.save(&path).unwrap();
 
-        let loaded = PipelineCache::load(&path, 2560, 1440).unwrap();
+        let loaded = PipelineCache::load(&path, 2560, 1440, TEST_VERSION).unwrap();
         assert_eq!(loaded, state);
     }
 
@@ -196,11 +218,11 @@ mod tests {
 
         let state = sample_state();
         // Write with a wrong version
-        let mut cache = PipelineCache::new(state, 2560, 1440);
+        let mut cache = PipelineCache::new(state, 2560, 1440, TEST_VERSION);
         cache.version = 999;
         cache.save(&path).unwrap();
 
-        let err = PipelineCache::load(&path, 2560, 1440).unwrap_err();
+        let err = PipelineCache::load(&path, 2560, 1440, TEST_VERSION).unwrap_err();
         assert!(matches!(err, CacheError::VersionMismatch { .. }));
     }
 
@@ -210,11 +232,11 @@ mod tests {
         let path = tmp.path().to_owned();
 
         let state = sample_state();
-        let cache = PipelineCache::new(state, 2560, 1440);
+        let cache = PipelineCache::new(state, 2560, 1440, TEST_VERSION);
         cache.save(&path).unwrap();
 
         // Load with different dimensions
-        let err = PipelineCache::load(&path, 1920, 1080).unwrap_err();
+        let err = PipelineCache::load(&path, 1920, 1080, TEST_VERSION).unwrap_err();
         assert!(matches!(err, CacheError::FrameSizeMismatch { .. }));
     }
 
@@ -225,17 +247,22 @@ mod tests {
 
         let mut state = sample_state();
         state.validated = false;
-        let cache = PipelineCache::new(state, 2560, 1440);
+        let cache = PipelineCache::new(state, 2560, 1440, TEST_VERSION);
         cache.save(&path).unwrap();
 
-        let err = PipelineCache::load(&path, 2560, 1440).unwrap_err();
+        let err = PipelineCache::load(&path, 2560, 1440, TEST_VERSION).unwrap_err();
         assert!(matches!(err, CacheError::Incomplete));
     }
 
     #[test]
     fn missing_file_returns_error() {
-        let err =
-            PipelineCache::load(Path::new("/nonexistent/cache.json"), 2560, 1440).unwrap_err();
+        let err = PipelineCache::load(
+            Path::new("/nonexistent/cache.json"),
+            2560,
+            1440,
+            TEST_VERSION,
+        )
+        .unwrap_err();
         assert!(matches!(err, CacheError::Io(_)));
     }
 
@@ -243,7 +270,7 @@ mod tests {
     fn corrupt_json_returns_error() {
         let mut tmp = NamedTempFile::new().unwrap();
         write!(tmp, "{{not valid json").unwrap();
-        let err = PipelineCache::load(tmp.path(), 2560, 1440).unwrap_err();
+        let err = PipelineCache::load(tmp.path(), 2560, 1440, TEST_VERSION).unwrap_err();
         assert!(matches!(err, CacheError::Json(_)));
     }
 }
