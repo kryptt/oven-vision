@@ -1,4 +1,5 @@
-use opencv::core::Mat;
+use opencv::core::{Mat, Point2f, Rect, Size, BORDER_CONSTANT, Scalar};
+use opencv::imgcodecs;
 use opencv::imgproc;
 use opencv::prelude::*;
 
@@ -128,7 +129,62 @@ impl DialDetector {
         &self.configs
     }
 
-    /// Detect all dials in the preprocessed grayscale image.
+    /// Detect all dials using template matching on the warped grayscale image.
+    ///
+    /// For each knob, extracts an ROI and matches the knob template at several
+    /// rotation angles. The best-matching angle gives the handle position.
+    /// angle=0° is the template's native orientation (OFF position).
+    ///
+    /// `knob_template` should be a grayscale `Mat` of the reference knob photo,
+    /// pre-scaled to match the warped image resolution.
+    pub fn detect_all_template(
+        &mut self,
+        warped_gray: &Mat,
+        knob_template: &Mat,
+    ) -> Result<Vec<DialReading>, opencv::Error> {
+        let mut results = Vec::with_capacity(self.configs.len());
+        let angles_to_test: Vec<f64> = (0..18).map(|i| i as f64 * 20.0).collect(); // 0-340° in 20° steps
+
+        for (i, cfg) in self.configs.iter().enumerate() {
+            let raw = detect_single_template(
+                warped_gray,
+                knob_template,
+                cfg,
+                &angles_to_test,
+            )?;
+
+            self.latest_angle[i] = raw.angle_deg;
+            self.latest_confidence[i] = raw.confidence;
+
+            // Hysteresis state machine (same as radial scan version)
+            let raw_state = raw.state;
+            let same_category = state_category(raw_state) == state_category(self.confirmed[i]);
+
+            if same_category {
+                self.transition_count[i] = 0;
+            } else if state_category(raw_state) == state_category(self.candidate[i]) {
+                self.transition_count[i] += 1;
+                if self.transition_count[i] >= HYSTERESIS_FRAMES {
+                    self.confirmed[i] = raw_state;
+                    self.transition_count[i] = 0;
+                }
+            } else {
+                self.candidate[i] = raw_state;
+                self.transition_count[i] = 1;
+            }
+
+            results.push(DialReading {
+                label: cfg.label.clone(),
+                state: self.confirmed[i],
+                angle_deg: self.latest_angle[i],
+                confidence: self.latest_confidence[i],
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Detect all dials in the preprocessed grayscale image (legacy radial scan).
     /// Uses hysteresis: state only changes after HYSTERESIS_FRAMES consecutive
     /// frames agree on a different state from the current confirmed state.
     pub fn detect_all(&mut self, preprocessed: &Mat) -> Result<Vec<DialReading>, opencv::Error> {
@@ -187,6 +243,102 @@ fn state_category(state: DialState) -> u8 {
 }
 
 /// Detect a single dial from the edge image and its configuration.
+/// Detect a single knob's state by template matching at multiple rotations.
+///
+/// Returns the best-matching rotation angle (0° = template as-is = OFF)
+/// and the match confidence. The off_angle from `cfg` is the calibration
+/// baseline (always 0° for template-based detection since the template
+/// IS the off position).
+fn detect_single_template(
+    warped_gray: &Mat,
+    knob_template: &Mat,
+    cfg: &DialConfig,
+    angles: &[f64],
+) -> Result<DialReading, opencv::Error> {
+    let cx = cfg.center_x as i32;
+    let cy = cfg.center_y as i32;
+    let r = cfg.radius as i32;
+    let margin = r * 2;
+
+    // Extract ROI around the knob (with margin for rotation)
+    let img_w = warped_gray.cols();
+    let img_h = warped_gray.rows();
+    let x0 = (cx - margin).max(0);
+    let y0 = (cy - margin).max(0);
+    let x1 = (cx + margin).min(img_w);
+    let y1 = (cy + margin).min(img_h);
+
+    if x1 - x0 < knob_template.cols() || y1 - y0 < knob_template.rows() {
+        return Ok(DialReading {
+            label: cfg.label.clone(),
+            state: DialState::Unavailable,
+            angle_deg: None,
+            confidence: 0.0,
+        });
+    }
+
+    let roi = Mat::roi(warped_gray, Rect::new(x0, y0, x1 - x0, y1 - y0))?;
+
+    let mut best_angle = 0.0f64;
+    let mut best_score = -1.0f64;
+
+    let templ_cx = knob_template.cols() as f64 / 2.0;
+    let templ_cy = knob_template.rows() as f64 / 2.0;
+
+    for &angle in angles {
+        // Rotate the template
+        let rot_mat = imgproc::get_rotation_matrix_2d(
+            Point2f::new(templ_cx as f32, templ_cy as f32),
+            -angle,
+            1.0,
+        )?;
+        let mut rotated = Mat::default();
+        imgproc::warp_affine(
+            knob_template,
+            &mut rotated,
+            &rot_mat,
+            Size::new(knob_template.cols(), knob_template.rows()),
+            imgproc::INTER_LINEAR,
+            BORDER_CONSTANT,
+            Scalar::default(),
+        )?;
+
+        if rotated.cols() > roi.cols() || rotated.rows() > roi.rows() {
+            continue;
+        }
+
+        let mut result = Mat::default();
+        imgproc::match_template(
+            &roi,
+            &rotated,
+            &mut result,
+            imgproc::TM_CCOEFF_NORMED,
+            &Mat::default(),
+        )?;
+
+        // Find max value
+        let mut min_val = 0.0;
+        let mut max_val = 0.0;
+        opencv::core::min_max_loc(&result, Some(&mut min_val), Some(&mut max_val), None, None, &Mat::default())?;
+
+        if max_val > best_score {
+            best_score = max_val;
+            best_angle = angle;
+        }
+    }
+
+    // Classify: angle 0 = OFF (template position), increasing angle = more ON
+    // The off_angle_deg should be 0 for template-based detection
+    let state = classify_dial(best_angle, cfg.off_angle_deg, cfg.off_tolerance_deg);
+
+    Ok(DialReading {
+        label: cfg.label.clone(),
+        state,
+        angle_deg: Some(best_angle),
+        confidence: best_score.max(0.0),
+    })
+}
+
 fn detect_single(edges: &Mat, cfg: &DialConfig) -> Result<DialReading, opencv::Error> {
     let (angle, strength) = radial_edge_scan(edges, cfg.center_x, cfg.center_y, cfg.radius)?;
 

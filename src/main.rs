@@ -115,9 +115,35 @@ async fn main() {
     let features = pipe
         .state()
         .features
-        .as_ref()
+        .clone()
         .expect("pipeline has no features");
-    let mut detector = DialDetector::from_features(features, labels_ref);
+    let mut detector = DialDetector::from_features(&features, labels_ref);
+
+    // Load and scale the knob template for per-frame template matching.
+    // Scale it to match the knob radius in the warped image.
+    let knob_template = {
+        let raw = opencv::imgcodecs::imread("/templates/knob.jpg", opencv::imgcodecs::IMREAD_GRAYSCALE)
+            .expect("failed to load /templates/knob.jpg");
+        // The template knob is ~100px diameter. Scale to 2× the detected knob radius.
+        let target_size = (features.knobs[0].radius * 2.0) as i32;
+        let scale = target_size as f64 / raw.cols().max(raw.rows()) as f64;
+        let new_w = (raw.cols() as f64 * scale) as i32;
+        let new_h = (raw.rows() as f64 * scale) as i32;
+        let mut scaled = opencv::core::Mat::default();
+        opencv::imgproc::resize(
+            &raw,
+            &mut scaled,
+            opencv::core::Size::new(new_w, new_h),
+            0.0,
+            0.0,
+            opencv::imgproc::INTER_AREA,
+        )
+        .expect("failed to scale knob template");
+        info!(original = %format!("{}x{}", raw.cols(), raw.rows()),
+              scaled = %format!("{}x{}", new_w, new_h),
+              "knob template loaded for per-frame detection");
+        scaled
+    };
 
     // Start MQTT with pipeline-derived dial configs
     if let Err(err) = publisher.start(detector.configs(), &cfg.leds).await {
@@ -125,6 +151,12 @@ async fn main() {
         std::process::exit(1);
     }
     debug_state.set_mqtt_connected(true);
+
+    // --- Off-angle auto-calibration ---
+    // The first few frames calibrate the off-angles (stove assumed off at startup).
+    const CALIBRATION_FRAMES: u64 = 5;
+    let mut off_angle_samples: Vec<Vec<f64>> = vec![Vec::new(); detector.configs().len()];
+    let mut off_calibrated = false;
 
     // --- Detection loop ---
     let mut sanity_fail_start: Option<Instant> = None;
@@ -142,7 +174,7 @@ async fn main() {
                     }
                 };
 
-                // Preprocess warped image for edge-based dial detection
+                // Convert warped image to grayscale for template matching
                 let gray = match preprocess(&warped) {
                     Ok(g) => g,
                     Err(err) => {
@@ -151,13 +183,44 @@ async fn main() {
                     }
                 };
 
-                let readings = match detector.detect_all(&gray) {
+                let readings = match detector.detect_all_template(&gray, &knob_template) {
                     Ok(r) => r,
                     Err(err) => {
                         error!(%err, "dial detection failed");
                         continue;
                     }
                 };
+
+                // Auto-calibrate off-angles from the first N frames
+                if !off_calibrated && frame_count < CALIBRATION_FRAMES {
+                    for (i, reading) in readings.iter().enumerate() {
+                        if let Some(angle) = reading.angle_deg {
+                            if i < off_angle_samples.len() {
+                                off_angle_samples[i].push(angle);
+                            }
+                        }
+                    }
+                    if frame_count + 1 >= CALIBRATION_FRAMES {
+                        // Compute median off-angle per knob and update detector
+                        let mut off_angles: Vec<f64> = Vec::new();
+                        for samples in &mut off_angle_samples {
+                            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            let median = if samples.is_empty() {
+                                0.0
+                            } else {
+                                samples[samples.len() / 2]
+                            };
+                            off_angles.push(median);
+                        }
+                        info!(?off_angles, "off-angle calibration complete");
+                        // Rebuild detector with calibrated off-angles
+                        let mut new_features = features.clone();
+                        new_features.off_angles = off_angles;
+                        detector = DialDetector::from_features(&new_features, labels_ref);
+                        off_calibrated = true;
+                    }
+                }
+
                 for reading in &readings {
                     info!(%reading, "dial reading");
                 }
