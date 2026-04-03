@@ -71,6 +71,8 @@ pub struct MqttConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DialConfig {
     pub label: String,
+    // NOTE: center_x, center_y, and radius are ignored in the v2 pipeline
+    // (positions come from self-calibration). Kept for label and tolerance use.
     pub center_x: u32,
     pub center_y: u32,
     pub radius: u32,

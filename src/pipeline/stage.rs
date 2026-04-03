@@ -85,16 +85,6 @@ pub enum StageId {
 }
 
 impl StageId {
-    /// All stages in order.
-    pub const ALL: [StageId; 6] = [
-        StageId::FindStove,
-        StageId::FindLines,
-        StageId::FindVerticals,
-        StageId::Perspective,
-        StageId::FindFeatures,
-        StageId::SanityCheck,
-    ];
-
     /// The previous stage to fall back to, if any.
     pub fn fallback(self) -> Option<StageId> {
         match self {
@@ -110,7 +100,7 @@ impl StageId {
         }
     }
 
-    /// Index into `StageId::ALL`.
+    /// Numeric index of this stage (matches enum discriminant).
     pub fn index(self) -> usize {
         self as usize
     }

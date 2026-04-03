@@ -6,6 +6,7 @@ pub mod find_verticals;
 pub mod perspective;
 pub mod sanity;
 pub mod stage;
+pub mod util;
 
 use std::path::Path;
 
@@ -294,16 +295,16 @@ impl Pipeline {
 /// Returns the warped image in the corrected coordinate space where knob
 /// positions from `PipelineState::features` are valid.
 ///
-/// # Panics
-///
-/// Panics if `state.crop` or `state.perspective` is `None` (i.e., pipeline
-/// has not been calibrated).
+/// Returns `Err` if `state.crop` or `state.perspective` is `None` (i.e.,
+/// pipeline has not been calibrated).
 pub fn warp_frame(state: &PipelineState, frame: &Mat) -> Result<Mat, opencv::Error> {
-    let crop = state.crop.as_ref().expect("pipeline state has no crop");
-    let persp = state
-        .perspective
+    let crop = state
+        .crop
         .as_ref()
-        .expect("pipeline state has no perspective");
+        .ok_or_else(|| opencv::Error::new(opencv::core::StsError, "pipeline state has no crop"))?;
+    let persp = state.perspective.as_ref().ok_or_else(|| {
+        opencv::Error::new(opencv::core::StsError, "pipeline state has no perspective")
+    })?;
 
     let roi = Rect::new(
         crop.x as i32,
@@ -357,7 +358,6 @@ impl From<opencv::Error> for PipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A mock stage that succeeds on the first attempt.

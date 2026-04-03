@@ -49,8 +49,7 @@ impl Stage for Perspective {
         frame: &Mat,
         iteration: u32,
     ) -> Result<StageOutcome, opencv::Error> {
-        let (Some(crop), Some(lines), Some(verts)) =
-            (&state.crop, &state.lines, &state.verticals)
+        let (Some(crop), Some(lines), Some(verts)) = (&state.crop, &state.lines, &state.verticals)
         else {
             return Ok(StageOutcome::Exhausted(
                 "missing crop, lines, or verticals from previous stages".into(),
@@ -111,10 +110,10 @@ impl Stage for Perspective {
         let left_x = ((tl.0 + bl.0) / 2.0) as f32;
         let right_x = ((tr.0 + br.0) / 2.0) as f32;
         let dst_pts: [Point2f; 4] = [
-            Point2f::new(left_x, top_pad as f32),                         // TL
-            Point2f::new(right_x, top_pad as f32),                        // TR
-            Point2f::new(right_x, (top_pad + inter_line) as f32),         // BR
-            Point2f::new(left_x, (top_pad + inter_line) as f32),          // BL
+            Point2f::new(left_x, top_pad as f32),                 // TL
+            Point2f::new(right_x, top_pad as f32),                // TR
+            Point2f::new(right_x, (top_pad + inter_line) as f32), // BR
+            Point2f::new(left_x, (top_pad + inter_line) as f32),  // BL
         ];
 
         let mat = imgproc::get_perspective_transform_slice_def(&src_pts, &dst_pts)?;
@@ -155,9 +154,12 @@ impl Stage for Perspective {
         state: &PipelineState,
         frame: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let (Some(crop), Some(lines), Some(verts), Some(persp)) =
-            (&state.crop, &state.lines, &state.verticals, &state.perspective)
-        else {
+        let (Some(crop), Some(lines), Some(verts), Some(persp)) = (
+            &state.crop,
+            &state.lines,
+            &state.verticals,
+            &state.perspective,
+        ) else {
             return Ok(None);
         };
 
@@ -222,7 +224,10 @@ impl Stage for Perspective {
         )?;
 
         let jpeg = encode_jpeg(&warped, 80)?;
-        let label = format!("S3:Perspective_{}x{}", persp.output_width, persp.output_height);
+        let label = format!(
+            "S3:Perspective_{}x{}",
+            persp.output_width, persp.output_height
+        );
         Ok(Some((label, jpeg)))
     }
 }

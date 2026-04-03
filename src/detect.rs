@@ -1,5 +1,4 @@
-use opencv::core::{Mat, Point2f, Rect, Size, BORDER_CONSTANT, Scalar};
-use opencv::imgcodecs;
+use opencv::core::{BORDER_CONSTANT, Mat, Point2f, Rect, Scalar, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
 
@@ -52,20 +51,16 @@ pub struct DialDetector {
 /// Maximum distinguishable angular distance (degrees).
 const MAX_ROTATION_DEG: f64 = 180.0;
 
-/// Minimum normalized edge strength to consider a detection valid.
-const MIN_EDGE_STRENGTH: f64 = 0.05;
-
-/// Number of radial sample points per angle.
-const RADIAL_SAMPLES: u32 = 15;
-
-/// Canny edge detection thresholds.
-const CANNY_LOW: f64 = 10.0;
-const CANNY_HIGH: f64 = 30.0;
-
 /// Number of consecutive frames required to confirm a state change.
 /// At 1 fps with 5s poll interval, this means ~15 seconds of consistent
 /// readings before flipping state.
 const HYSTERESIS_FRAMES: u32 = 3;
+
+/// Pre-computed rotation angles for template matching (0-340 in 20-degree steps).
+const TEMPLATE_ANGLES: [f64; 18] = [
+    0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0, 220.0, 240.0, 260.0,
+    280.0, 300.0, 320.0, 340.0,
+];
 
 /// Default dial labels in left-to-right order (matching the stove layout).
 const DEFAULT_LABELS: [&str; 10] = [
@@ -143,38 +138,22 @@ impl DialDetector {
         knob_template: &Mat,
     ) -> Result<Vec<DialReading>, opencv::Error> {
         let mut results = Vec::with_capacity(self.configs.len());
-        let angles_to_test: Vec<f64> = (0..18).map(|i| i as f64 * 20.0).collect(); // 0-340° in 20° steps
 
-        for (i, cfg) in self.configs.iter().enumerate() {
+        for i in 0..self.configs.len() {
             let raw = detect_single_template(
                 warped_gray,
                 knob_template,
-                cfg,
-                &angles_to_test,
+                &self.configs[i],
+                &TEMPLATE_ANGLES,
             )?;
 
             self.latest_angle[i] = raw.angle_deg;
             self.latest_confidence[i] = raw.confidence;
 
-            // Hysteresis state machine (same as radial scan version)
-            let raw_state = raw.state;
-            let same_category = state_category(raw_state) == state_category(self.confirmed[i]);
-
-            if same_category {
-                self.transition_count[i] = 0;
-            } else if state_category(raw_state) == state_category(self.candidate[i]) {
-                self.transition_count[i] += 1;
-                if self.transition_count[i] >= HYSTERESIS_FRAMES {
-                    self.confirmed[i] = raw_state;
-                    self.transition_count[i] = 0;
-                }
-            } else {
-                self.candidate[i] = raw_state;
-                self.transition_count[i] = 1;
-            }
+            self.apply_hysteresis(i, raw.state);
 
             results.push(DialReading {
-                label: cfg.label.clone(),
+                label: self.configs[i].label.clone(),
                 state: self.confirmed[i],
                 angle_deg: self.latest_angle[i],
                 confidence: self.latest_confidence[i],
@@ -184,51 +163,20 @@ impl DialDetector {
         Ok(results)
     }
 
-    /// Detect all dials in the preprocessed grayscale image (legacy radial scan).
-    /// Uses hysteresis: state only changes after HYSTERESIS_FRAMES consecutive
-    /// frames agree on a different state from the current confirmed state.
-    pub fn detect_all(&mut self, preprocessed: &Mat) -> Result<Vec<DialReading>, opencv::Error> {
-        let mut edges = Mat::default();
-        imgproc::canny(preprocessed, &mut edges, CANNY_LOW, CANNY_HIGH, 3, false)?;
-
-        let mut results = Vec::with_capacity(self.configs.len());
-
-        for (i, cfg) in self.configs.iter().enumerate() {
-            let raw = detect_single(&edges, cfg)?;
-
-            self.latest_angle[i] = raw.angle_deg;
-            self.latest_confidence[i] = raw.confidence;
-
-            // Hysteresis state machine
-            let raw_state = raw.state;
-            let same_category = state_category(raw_state) == state_category(self.confirmed[i]);
-
-            if same_category {
-                // Raw agrees with confirmed — reset transition counter
+    fn apply_hysteresis(&mut self, i: usize, raw_state: DialState) {
+        let same_category = state_category(raw_state) == state_category(self.confirmed[i]);
+        if same_category {
+            self.transition_count[i] = 0;
+        } else if state_category(raw_state) == state_category(self.candidate[i]) {
+            self.transition_count[i] += 1;
+            if self.transition_count[i] >= HYSTERESIS_FRAMES {
+                self.confirmed[i] = raw_state;
                 self.transition_count[i] = 0;
-            } else if state_category(raw_state) == state_category(self.candidate[i]) {
-                // Raw agrees with the candidate (different from confirmed) — accumulate
-                self.transition_count[i] += 1;
-                if self.transition_count[i] >= HYSTERESIS_FRAMES {
-                    // Transition confirmed
-                    self.confirmed[i] = raw_state;
-                    self.transition_count[i] = 0;
-                }
-            } else {
-                // New candidate — reset counter
-                self.candidate[i] = raw_state;
-                self.transition_count[i] = 1;
             }
-
-            results.push(DialReading {
-                label: cfg.label.clone(),
-                state: self.confirmed[i],
-                angle_deg: self.latest_angle[i],
-                confidence: self.latest_confidence[i],
-            });
+        } else {
+            self.candidate[i] = raw_state;
+            self.transition_count[i] = 1;
         }
-
-        Ok(results)
     }
 }
 
@@ -242,7 +190,6 @@ fn state_category(state: DialState) -> u8 {
     }
 }
 
-/// Detect a single dial from the edge image and its configuration.
 /// Detect a single knob's state by template matching at multiple rotations.
 ///
 /// Returns the best-matching rotation angle (0° = template as-is = OFF)
@@ -319,7 +266,14 @@ fn detect_single_template(
         // Find max value
         let mut min_val = 0.0;
         let mut max_val = 0.0;
-        opencv::core::min_max_loc(&result, Some(&mut min_val), Some(&mut max_val), None, None, &Mat::default())?;
+        opencv::core::min_max_loc(
+            &result,
+            Some(&mut min_val),
+            Some(&mut max_val),
+            None,
+            None,
+            &Mat::default(),
+        )?;
 
         if max_val > best_score {
             best_score = max_val;
@@ -337,101 +291,6 @@ fn detect_single_template(
         angle_deg: Some(best_angle),
         confidence: best_score.max(0.0),
     })
-}
-
-fn detect_single(edges: &Mat, cfg: &DialConfig) -> Result<DialReading, opencv::Error> {
-    let (angle, strength) = radial_edge_scan(edges, cfg.center_x, cfg.center_y, cfg.radius)?;
-
-    if strength < MIN_EDGE_STRENGTH {
-        return Ok(DialReading {
-            label: cfg.label.clone(),
-            state: DialState::Unavailable,
-            angle_deg: None,
-            confidence: strength,
-        });
-    }
-
-    let state = classify_dial(angle, cfg.off_angle_deg, cfg.off_tolerance_deg);
-
-    Ok(DialReading {
-        label: cfg.label.clone(),
-        state,
-        angle_deg: Some(angle),
-        confidence: strength,
-    })
-}
-
-/// Core detection: scan radial lines on the edge image and find the angle
-/// with the strongest mean edge response.
-///
-/// Returns `(best_angle_degrees, max_normalized_strength)`.
-pub fn radial_edge_scan(
-    edges: &Mat,
-    cx: u32,
-    cy: u32,
-    radius: u32,
-) -> Result<(f64, f64), opencv::Error> {
-    let w = edges.cols() as u32;
-    let h = edges.rows() as u32;
-    let step = edges.step1(0)? as u32;
-    let data = edges.data_bytes()?;
-
-    let mut profile = [0.0f64; 360];
-
-    for deg in 0u32..360 {
-        let rad = (deg as f64).to_radians();
-        let cos_a = rad.cos();
-        let sin_a = rad.sin();
-
-        let mut sum = 0.0f64;
-        let mut count = 0u32;
-
-        for s in 0..RADIAL_SAMPLES {
-            // Sample from 50% to 100% of radius
-            let frac = 0.5 + 0.5 * (s as f64) / ((RADIAL_SAMPLES - 1) as f64);
-            let r = (radius as f64) * frac;
-
-            let px = (cx as f64 + r * cos_a).round() as i64;
-            let py = (cy as f64 + r * sin_a).round() as i64;
-
-            if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
-                let idx = (py as u32) * step + (px as u32);
-                sum += data[idx as usize] as f64;
-                count += 1;
-            }
-        }
-
-        profile[deg as usize] = if count > 0 { sum / count as f64 } else { 0.0 };
-    }
-
-    // Smooth the angular profile with a small Gaussian kernel (sigma ~2°, width 7)
-    let kernel = [0.006, 0.061, 0.242, 0.383, 0.242, 0.061, 0.006];
-    let half = (kernel.len() / 2) as i32;
-    let mut smoothed = [0.0f64; 360];
-
-    for i in 0..360 {
-        let mut val = 0.0;
-        for (k, &weight) in kernel.iter().enumerate() {
-            let j = ((i as i32 + k as i32 - half) % 360 + 360) % 360;
-            val += profile[j as usize] * weight;
-        }
-        smoothed[i] = val;
-    }
-
-    // Find the peak
-    let mut best_angle = 0usize;
-    let mut best_val = 0.0f64;
-    for (i, &val) in smoothed.iter().enumerate() {
-        if val > best_val {
-            best_val = val;
-            best_angle = i;
-        }
-    }
-
-    // Normalize strength to 0.0-1.0 (edge pixels are 255 in Canny output)
-    let normalized = best_val / 255.0;
-
-    Ok((best_angle as f64, normalized))
 }
 
 /// Classify a detected angle into a `DialState` based on the calibrated

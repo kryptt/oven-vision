@@ -112,18 +112,21 @@ async fn main() {
     } else {
         Some(labels.as_slice())
     };
-    let features = pipe
-        .state()
-        .features
-        .clone()
-        .expect("pipeline has no features");
+    let features = match pipe.state().features.clone() {
+        Some(f) => f,
+        None => {
+            error!("pipeline has no features after calibration");
+            std::process::exit(1);
+        }
+    };
     let mut detector = DialDetector::from_features(&features, labels_ref);
 
     // Load and scale the knob template for per-frame template matching.
     // Scale it to match the knob radius in the warped image.
     let knob_template = {
-        let raw = opencv::imgcodecs::imread("/templates/knob.jpg", opencv::imgcodecs::IMREAD_GRAYSCALE)
-            .expect("failed to load /templates/knob.jpg");
+        let raw =
+            opencv::imgcodecs::imread("/templates/knob.jpg", opencv::imgcodecs::IMREAD_GRAYSCALE)
+                .expect("failed to load /templates/knob.jpg");
         // The template knob is ~100px diameter. Scale to 2× the detected knob radius.
         let target_size = (features.knobs[0].radius * 2.0) as i32;
         let scale = target_size as f64 / raw.cols().max(raw.rows()) as f64;
@@ -204,7 +207,9 @@ async fn main() {
                         // Compute median off-angle per knob and update detector
                         let mut off_angles: Vec<f64> = Vec::new();
                         for samples in &mut off_angle_samples {
-                            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            samples.sort_by(|a, b| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            });
                             let median = if samples.is_empty() {
                                 0.0
                             } else {

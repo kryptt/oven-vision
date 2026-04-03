@@ -1,10 +1,11 @@
 use std::f64::consts::PI;
 
-use opencv::core::{Mat, Point, Rect, Scalar, Size, Vec2f, Vector};
+use opencv::core::{Mat, Rect, Scalar, Size, Vec2f, Vector};
 use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{Line, LinePair, PipelineState, StageId, StageOutcome};
+use super::util::{cluster_average, cluster_by_rho, draw_line};
 use super::{DebugImage, Stage};
 use crate::annotate::encode_jpeg;
 
@@ -167,7 +168,11 @@ impl Stage for FindLines {
         }
 
         // Sort by score descending (best first)
-        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Pick the pair at index = iteration % 5 (cycles within each threshold group)
         let pair_idx = (iteration % 5) as usize;
@@ -219,10 +224,7 @@ impl Stage for FindLines {
             Scalar::new(255.0, 0.0, 0.0, 0.0),
         )?;
 
-        let label = format!(
-            "S2:FindLines_T{:.0}_B{:.0}",
-            lines.top.y1, lines.bottom.y1
-        );
+        let label = format!("S2:FindLines_T{:.0}_B{:.0}", lines.top.y1, lines.bottom.y1);
         let jpeg = encode_jpeg(&canvas, 80)?;
         Ok(Some((label, jpeg)))
     }
@@ -243,12 +245,7 @@ struct CandidatePair {
 ///   - position:    1 - avg_rho / crop_height          (upper half = better — chrome trim)
 ///   - parallelism: 1 - |Δtheta| / max_Δtheta         (parallel = better)
 ///   - strength:    avg_votes / max_votes              (stronger = better)
-fn score_pair(
-    top: (f64, f64, usize),
-    bot: (f64, f64, usize),
-    crop_h: f64,
-    max_votes: f64,
-) -> f64 {
+fn score_pair(top: (f64, f64, usize), bot: (f64, f64, usize), crop_h: f64, max_votes: f64) -> f64 {
     let span = bot.0 - top.0;
     let span_norm = (span / crop_h).min(1.0);
 
@@ -283,47 +280,4 @@ fn rho_theta_to_line(rho: f64, theta: f64, width: f64) -> Line {
         x2: width,
         y2: y_at_w,
     }
-}
-
-/// Cluster lines by rho proximity.
-fn cluster_by_rho(lines: &[(f64, f64)], threshold: f64) -> Vec<Vec<(f64, f64)>> {
-    let mut sorted: Vec<(f64, f64)> = lines.to_vec();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut clusters: Vec<Vec<(f64, f64)>> = Vec::new();
-    for &(rho, theta) in &sorted {
-        let mut added = false;
-        for cluster in &mut clusters {
-            let avg_rho: f64 = cluster.iter().map(|&(r, _)| r).sum::<f64>() / cluster.len() as f64;
-            if (rho - avg_rho).abs() <= threshold {
-                cluster.push((rho, theta));
-                added = true;
-                break;
-            }
-        }
-        if !added {
-            clusters.push(vec![(rho, theta)]);
-        }
-    }
-    clusters
-}
-
-/// Average rho and theta for a cluster.
-fn cluster_average(cluster: &[(f64, f64)]) -> (f64, f64) {
-    let n = cluster.len() as f64;
-    let rho = cluster.iter().map(|&(r, _)| r).sum::<f64>() / n;
-    let theta = cluster.iter().map(|&(_, t)| t).sum::<f64>() / n;
-    (rho, theta)
-}
-
-fn draw_line(canvas: &mut Mat, line: &Line, color: Scalar) -> Result<(), opencv::Error> {
-    imgproc::line(
-        canvas,
-        Point::new(line.x1 as i32, line.y1 as i32),
-        Point::new(line.x2 as i32, line.y2 as i32),
-        color,
-        2,
-        imgproc::LINE_8,
-        0,
-    )
 }

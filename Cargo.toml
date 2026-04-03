@@ -19,10 +19,6 @@ axum = "0.8"
 name = "oven-vision"
 path = "src/main.rs"
 
-[[bin]]
-name = "calibrate"
-path = "src/bin/calibrate.rs"
-
 [dev-dependencies]
 tempfile = "3"
 

@@ -67,7 +67,7 @@ impl Stage for SanityCheck {
 
         // Check 2: Y alignment — all knob centers within tolerance of median Y
         let mut ys: Vec<f64> = features.knobs.iter().map(|k| k.center_y).collect();
-        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_y = ys[ys.len() / 2];
 
         for (i, knob) in features.knobs.iter().enumerate() {
@@ -93,7 +93,7 @@ impl Stage for SanityCheck {
 
         // Check 4: radius consistency
         let mut radii: Vec<f64> = features.knobs.iter().map(|k| k.radius).collect();
-        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_r = radii[radii.len() / 2];
         let r_lo = median_r / MAX_RADIUS_FACTOR;
         let r_hi = median_r * MAX_RADIUS_FACTOR;
@@ -255,7 +255,7 @@ pub fn quick_sanity_check(warped: &Mat) -> Result<bool, opencv::Error> {
 
     // Check Y alignment of the majority of circles
     let mut ys: Vec<f64> = circles.iter().map(|c| c[1] as f64).collect();
-    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median_y = ys[ys.len() / 2];
 
     let aligned = ys

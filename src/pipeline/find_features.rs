@@ -1,5 +1,5 @@
 use opencv::core::{
-    Mat, MatTraitConst, Point, Point2f, Rect, Scalar, Size, Vector, BORDER_CONSTANT,
+    BORDER_CONSTANT, Mat, MatTraitConst, Point, Point2f, Rect, Scalar, Size, Vector,
 };
 use opencv::imgcodecs;
 use opencv::imgproc;
@@ -78,9 +78,7 @@ impl Stage for FindFeatures {
         };
 
         if self.knob_template.empty() || self.clock_template.empty() {
-            return Ok(StageOutcome::Exhausted(
-                "template images not loaded".into(),
-            ));
+            return Ok(StageOutcome::Exhausted("template images not loaded".into()));
         }
 
         // Warp the cropped frame
@@ -209,8 +207,13 @@ impl Stage for FindFeatures {
                 &Mat::default(),
             )?;
 
-            let mut peaks =
-                find_peaks(&result, threshold, scaled_clock.cols(), scaled_clock.rows(), 0.0)?;
+            let mut peaks = find_peaks(
+                &result,
+                threshold,
+                scaled_clock.cols(),
+                scaled_clock.rows(),
+                0.0,
+            )?;
             // Clock should also be in the knob Y-band
             peaks.retain(|m| m.y >= knob_y_min && m.y <= knob_y_max);
             if !peaks.is_empty() {
@@ -224,7 +227,11 @@ impl Stage for FindFeatures {
 
         // Sort knob matches by score descending
         let mut sorted_knobs = knob_results;
-        sorted_knobs.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        sorted_knobs.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Select top matches that are Y-aligned (best 10 by Y-consistency)
         let selected = select_y_aligned_knobs(&sorted_knobs, EXPECTED_KNOBS, knob_r);
@@ -238,7 +245,7 @@ impl Stage for FindFeatures {
         // Determine clock
         let knob_median_y = {
             let mut ys: Vec<f64> = knobs.iter().map(|k| k.center_y).collect();
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             ys[ys.len() / 2]
         };
         let leftmost_knob_x = knobs
@@ -422,7 +429,8 @@ fn resize_template(template: &Mat, scale: f64) -> Result<Mat, opencv::Error> {
 fn rotate_template(template: &Mat, angle_deg: f64) -> Result<Mat, opencv::Error> {
     let cx = template.cols() as f64 / 2.0;
     let cy = template.rows() as f64 / 2.0;
-    let rot_mat = imgproc::get_rotation_matrix_2d(Point2f::new(cx as f32, cy as f32), -angle_deg, 1.0)?;
+    let rot_mat =
+        imgproc::get_rotation_matrix_2d(Point2f::new(cx as f32, cy as f32), -angle_deg, 1.0)?;
 
     let mut rotated = Mat::default();
     imgproc::warp_affine(
@@ -467,14 +475,22 @@ fn find_peaks(
         }
     }
 
-    matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(matches)
 }
 
 /// Non-maximum suppression: keep the highest-scoring matches, removing
 /// any that are within `min_dist` of a higher-scoring match.
 fn nms(matches: &mut Vec<TemplateMatch>, min_dist: f64) -> Vec<TemplateMatch> {
-    matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut kept: Vec<TemplateMatch> = Vec::new();
     let min_dist_sq = min_dist * min_dist;
@@ -508,7 +524,7 @@ fn select_y_aligned_knobs(
 
     let unique_ys: Vec<f64> = {
         let mut ys: Vec<f64> = matches.iter().map(|m| m.y).collect();
-        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         ys.dedup_by(|a, b| (*a - *b).abs() < 3.0);
         ys
     };
@@ -524,15 +540,19 @@ fn select_y_aligned_knobs(
         }
 
         // Sort by X
-        by_y.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        by_y.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
 
         // Take the best N by score among those that are Y-close
         let mut by_score: Vec<&TemplateMatch> = by_y.clone();
-        by_score.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        by_score.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         by_score.truncate(n);
 
         // Re-sort by X
-        by_score.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        by_score.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
 
         // Check monotonic X with min gap
         let mut ok = true;
@@ -548,8 +568,7 @@ fn select_y_aligned_knobs(
 
         // Score: Y-variance (lower is better)
         let mean_y: f64 = by_score.iter().map(|m| m.y).sum::<f64>() / n as f64;
-        let y_var: f64 =
-            by_score.iter().map(|m| (m.y - mean_y).powi(2)).sum::<f64>() / n as f64;
+        let y_var: f64 = by_score.iter().map(|m| (m.y - mean_y).powi(2)).sum::<f64>() / n as f64;
         let y_score = 1.0 / (1.0 + y_var);
 
         let is_better = best.as_ref().is_none_or(|(_, s)| y_score > *s);
