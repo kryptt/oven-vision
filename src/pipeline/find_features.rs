@@ -1,4 +1,7 @@
-use opencv::core::{Mat, Point, Rect, Scalar, Size, Vec3f, Vector};
+use opencv::core::{
+    Mat, MatTraitConst, Point, Point2f, Rect, Scalar, Size, Vector, BORDER_CONSTANT,
+};
+use opencv::imgcodecs;
 use opencv::imgproc;
 use opencv::prelude::*;
 
@@ -6,57 +9,54 @@ use super::perspective::transform_to_mat;
 use super::stage::{CircleFeature, DetectedFeatures, PipelineState, StageId, StageOutcome};
 use super::{DebugImage, Stage};
 use crate::annotate::encode_jpeg;
-use crate::detect::radial_edge_scan;
 
 /// Expected knob count (excluding the clock).
 const EXPECTED_KNOBS: usize = 10;
 
-/// Minimum radius threshold — circles smaller than this are noise.
-const MIN_RADIUS: i32 = 5;
+/// Template matching threshold (TM_CCOEFF_NORMED). Matches below this are ignored.
+const MATCH_THRESHOLD: f64 = 0.35;
 
-/// Maximum radius for any feature (knobs and clock).
-const MAX_RADIUS: i32 = 50;
+/// Minimum distance between two accepted match positions (pixels in warped image).
+/// Prevents double-detections of the same knob.
+const NMS_MIN_DIST: f64 = 15.0;
 
-/// Raise the max-circles cap: we over-detect on purpose and filter by model.
-const MAX_CIRCLES: usize = 60;
+/// Scale factors to try. The phone template knob ring is ~100px diameter;
+/// the warped knob is ~20-50px. Scale range 0.15-0.50.
+const SCALE_FACTORS: [f64; 8] = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.15];
 
-/// --- Proportion constraints from the Boretti Toscana reference image ---
+/// Rotation step in degrees for knob template matching.
+const ROTATION_STEP_DEG: f64 = 10.0;
 
-/// The clock radius is ~1.5× the median knob radius. Accept 1.2-2.5×.
-const CLOCK_RADIUS_RATIO_MIN: f64 = 1.2;
-const CLOCK_RADIUS_RATIO_MAX: f64 = 2.5;
+/// Path to template images (bundled in container at build time).
+const KNOB_TEMPLATE_PATH: &str = "/templates/knob.jpg";
+const CLOCK_TEMPLATE_PATH: &str = "/templates/clock.jpg";
 
-/// The clock center Y must be within this many knob-radii of the knob row
-/// median Y (the clock is in the same row as the knobs).
-const CLOCK_Y_TOLERANCE_RADII: f64 = 3.0;
-
-/// Maximum coefficient of variation of inter-knob X spacing. The reference
-/// image shows very even spacing (CV < 0.15). Reject sets with CV > this.
-const MAX_SPACING_CV: f64 = 0.5;
-
-/// Maximum coefficient of variation of knob radii. The reference shows
-/// uniform knob sizes (CV < 0.1). Reject sets with CV > this.
-const MAX_RADIUS_CV: f64 = 0.4;
-
-/// Stage 4: Detect circular features (clock + 10 knobs) in the
-/// perspective-corrected image.
+/// Stage 4: Detect features using multi-scale, multi-rotation template matching.
 ///
-/// Strategy: over-detect with loose HoughCircles, then use model-based
-/// consensus to find the best 10+1 subset matching the geometric pattern
-/// (10 Y-aligned, similarly-sized knobs + 1 larger clock to their left).
-pub struct FindFeatures;
+/// Uses reference photos of the actual knob and clock to find their positions
+/// in the perspective-corrected image. Each knob match also yields the handle
+/// angle directly (the rotation that scored highest).
+pub struct FindFeatures {
+    knob_template: Mat,
+    clock_template: Mat,
+}
 
 impl FindFeatures {
     pub fn new() -> Self {
-        Self
-    }
-
-    fn params_for_iteration(iteration: u32) -> (f64, f64, f64) {
-        let param1 = 100.0;
-        // Start loose, get even looser — we want many candidates
-        let param2 = (40.0 - iteration as f64 * 1.5).max(8.0);
-        let min_dist = (25.0 - iteration as f64 * 0.5).max(8.0);
-        (param1, param2, min_dist)
+        let knob_template = imgcodecs::imread(KNOB_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
+            .unwrap_or_else(|e| {
+                tracing::warn!(%e, path = KNOB_TEMPLATE_PATH, "failed to load knob template, using empty");
+                Mat::default()
+            });
+        let clock_template = imgcodecs::imread(CLOCK_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
+            .unwrap_or_else(|e| {
+                tracing::warn!(%e, path = CLOCK_TEMPLATE_PATH, "failed to load clock template, using empty");
+                Mat::default()
+            });
+        Self {
+            knob_template,
+            clock_template,
+        }
     }
 }
 
@@ -77,6 +77,12 @@ impl Stage for FindFeatures {
             ));
         };
 
+        if self.knob_template.empty() || self.clock_template.empty() {
+            return Ok(StageOutcome::Exhausted(
+                "template images not loaded".into(),
+            ));
+        }
+
         // Warp the cropped frame
         let roi_rect = Rect::new(
             crop.x as i32,
@@ -95,70 +101,193 @@ impl Stage for FindFeatures {
             Size::new(persp.output_width as i32, persp.output_height as i32),
         )?;
 
-        // Grayscale + CLAHE + blur
+        // Compute the Y-band where knobs should be.
+        // The warped image height is top_pad + inter_line + bot_pad.
+        // The trim lines are at Y=top_pad and Y=top_pad+inter_line.
+        // From the Boretti reference, knobs are at ~15-35% of image height
+        // (between the bottom trim and partway to the oven doors).
+        let img_h = persp.output_height as f64;
+        let knob_y_min = img_h * 0.10;
+        let knob_y_max = img_h * 0.45;
+
+        // Convert to grayscale
         let mut gray = Mat::default();
         imgproc::cvt_color_def(&warped, &mut gray, imgproc::COLOR_BGR2GRAY)?;
 
+        // Enhance contrast
         let mut enhanced = Mat::default();
         let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
         clahe.apply(&gray, &mut enhanced)?;
 
-        let mut blurred = Mat::default();
-        imgproc::median_blur(&enhanced, &mut blurred, 5)?;
+        // Pick scale based on iteration (cycle through scales, then repeat with lower threshold)
+        let scale_idx = (iteration as usize) % SCALE_FACTORS.len();
+        let scale = SCALE_FACTORS[scale_idx];
+        let threshold_adj = (iteration as usize / SCALE_FACTORS.len()) as f64 * 0.05;
+        let threshold = (MATCH_THRESHOLD - threshold_adj).max(0.15);
 
-        // Over-detect: loose HoughCircles params
-        let (param1, param2, min_dist) = Self::params_for_iteration(iteration);
-
-        let mut circles = Vector::<Vec3f>::new();
-        imgproc::hough_circles(
-            &blurred,
-            &mut circles,
-            imgproc::HOUGH_GRADIENT,
-            1.0,
-            min_dist,
-            param1,
-            param2,
-            MIN_RADIUS,
-            MAX_RADIUS,
-        )?;
-
-        let count = circles.len();
-        if count < EXPECTED_KNOBS + 1 {
+        // --- Find knobs: multi-rotation template matching ---
+        let scaled_knob = resize_template(&self.knob_template, scale)?;
+        if scaled_knob.cols() < 5 || scaled_knob.rows() < 5 {
             return Ok(StageOutcome::Retry(format!(
-                "found {count} circles (need {}+), param2={param2:.0}",
-                EXPECTED_KNOBS + 1
-            )));
-        }
-        if count > MAX_CIRCLES {
-            return Ok(StageOutcome::Retry(format!(
-                "found {count} circles (max {MAX_CIRCLES}), param2={param2:.0} too loose"
+                "knob template too small at scale {scale:.2}"
             )));
         }
 
-        // Convert all candidates
-        let candidates: Vec<CircleFeature> = circles
-            .iter()
-            .map(|c| CircleFeature {
-                center_x: c[0] as f64,
-                center_y: c[1] as f64,
-                radius: c[2] as f64,
-            })
-            .collect();
+        // Enhance template contrast to match
+        let mut knob_enhanced = Mat::default();
+        clahe.apply(&scaled_knob, &mut knob_enhanced)?;
 
-        // Model-based selection: find the best 10+1 subset
-        match select_best_pattern(&candidates) {
-            Some((clock, knobs, _score)) => {
-                state.features = Some(DetectedFeatures {
-                    clock,
-                    knobs,
-                    off_angles: vec![0.0; EXPECTED_KNOBS],
-                });
-                Ok(StageOutcome::Success)
+        let mut all_knob_matches: Vec<TemplateMatch> = Vec::new();
+
+        let n_rotations = (360.0 / ROTATION_STEP_DEG) as i32;
+        for rot_idx in 0..n_rotations {
+            let angle = rot_idx as f64 * ROTATION_STEP_DEG;
+            let rotated = rotate_template(&knob_enhanced, angle)?;
+            if rotated.empty() {
+                continue;
             }
-            None => Ok(StageOutcome::Retry(format!(
-                "no valid 10+1 pattern in {count} candidates, param2={param2:.0}"
-            ))),
+
+            // Skip if template is larger than image
+            if rotated.cols() >= enhanced.cols() || rotated.rows() >= enhanced.rows() {
+                continue;
+            }
+
+            let mut result = Mat::default();
+            imgproc::match_template(
+                &enhanced,
+                &rotated,
+                &mut result,
+                imgproc::TM_CCOEFF_NORMED,
+                &Mat::default(),
+            )?;
+
+            // Find peaks above threshold
+            let matches = find_peaks(&result, threshold, rotated.cols(), rotated.rows(), angle)?;
+            all_knob_matches.extend(matches);
         }
+
+        // Filter to Y-band where knobs should be
+        all_knob_matches.retain(|m| m.y >= knob_y_min && m.y <= knob_y_max);
+
+        if all_knob_matches.len() < EXPECTED_KNOBS {
+            return Ok(StageOutcome::Retry(format!(
+                "found {} knob matches in Y-band [{knob_y_min:.0}..{knob_y_max:.0}] (need {}), scale={scale:.2}, threshold={threshold:.2}",
+                all_knob_matches.len(),
+                EXPECTED_KNOBS
+            )));
+        }
+
+        // NMS: keep best non-overlapping matches
+        let knob_results = nms(&mut all_knob_matches, NMS_MIN_DIST);
+
+        if knob_results.len() < EXPECTED_KNOBS {
+            return Ok(StageOutcome::Retry(format!(
+                "only {} knob matches after NMS (need {}), scale={scale:.2}",
+                knob_results.len(),
+                EXPECTED_KNOBS
+            )));
+        }
+
+        // --- Find clock: scale-only matching (no rotation) ---
+        let scaled_clock = resize_template(&self.clock_template, scale)?;
+        let mut clock_match: Option<TemplateMatch> = None;
+
+        if scaled_clock.cols() >= 5
+            && scaled_clock.rows() >= 5
+            && scaled_clock.cols() < enhanced.cols()
+            && scaled_clock.rows() < enhanced.rows()
+        {
+            let mut clock_enhanced = Mat::default();
+            clahe.apply(&scaled_clock, &mut clock_enhanced)?;
+
+            let mut result = Mat::default();
+            imgproc::match_template(
+                &enhanced,
+                &clock_enhanced,
+                &mut result,
+                imgproc::TM_CCOEFF_NORMED,
+                &Mat::default(),
+            )?;
+
+            let mut peaks =
+                find_peaks(&result, threshold, scaled_clock.cols(), scaled_clock.rows(), 0.0)?;
+            // Clock should also be in the knob Y-band
+            peaks.retain(|m| m.y >= knob_y_min && m.y <= knob_y_max);
+            if !peaks.is_empty() {
+                clock_match = Some(peaks[0].clone());
+            }
+        }
+
+        // --- Select the best 10+1 pattern from matches ---
+        let knob_r = scaled_knob.cols() as f64 / 2.0;
+        let clock_r = scaled_clock.cols().max(scaled_clock.rows()) as f64 / 2.0;
+
+        // Sort knob matches by score descending
+        let mut sorted_knobs = knob_results;
+        sorted_knobs.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        // Select top matches that are Y-aligned (best 10 by Y-consistency)
+        let selected = select_y_aligned_knobs(&sorted_knobs, EXPECTED_KNOBS, knob_r);
+
+        let Some(knobs) = selected else {
+            return Ok(StageOutcome::Retry(format!(
+                "could not find {EXPECTED_KNOBS} Y-aligned knob matches, scale={scale:.2}"
+            )));
+        };
+
+        // Determine clock
+        let knob_median_y = {
+            let mut ys: Vec<f64> = knobs.iter().map(|k| k.center_y).collect();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ys[ys.len() / 2]
+        };
+        let leftmost_knob_x = knobs
+            .iter()
+            .map(|k| k.center_x)
+            .fold(f64::INFINITY, f64::min);
+
+        let clock = if let Some(cm) = clock_match {
+            // Validate clock is left of knobs and near the same Y
+            if cm.x < leftmost_knob_x && (cm.y - knob_median_y).abs() < knob_r * 4.0 {
+                CircleFeature {
+                    center_x: cm.x,
+                    center_y: cm.y,
+                    radius: clock_r,
+                }
+            } else {
+                // Clock match in wrong position — synthesize from knob row
+                CircleFeature {
+                    center_x: leftmost_knob_x - knob_r * 4.0,
+                    center_y: knob_median_y,
+                    radius: clock_r,
+                }
+            }
+        } else {
+            // No clock match — estimate position from knob row
+            CircleFeature {
+                center_x: leftmost_knob_x - knob_r * 4.0,
+                center_y: knob_median_y,
+                radius: clock_r,
+            }
+        };
+
+        // Extract off-angles from the best-matching rotation per knob
+        let off_angles: Vec<f64> = knobs.iter().map(|k| k.angle).collect();
+
+        state.features = Some(DetectedFeatures {
+            clock,
+            knobs: knobs
+                .iter()
+                .map(|k| CircleFeature {
+                    center_x: k.center_x,
+                    center_y: k.center_y,
+                    radius: knob_r,
+                })
+                .collect(),
+            off_angles,
+        });
+
+        Ok(StageOutcome::Success)
     }
 
     fn max_retries(&self) -> u32 {
@@ -193,46 +322,7 @@ impl Stage for FindFeatures {
             Size::new(persp.output_width as i32, persp.output_height as i32),
         )?;
 
-        // Also re-run HoughCircles to show ALL candidates in red (dim)
-        {
-            let mut gray = Mat::default();
-            imgproc::cvt_color_def(&canvas, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-            let mut enhanced = Mat::default();
-            let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
-            clahe.apply(&gray, &mut enhanced)?;
-            let mut blurred = Mat::default();
-            imgproc::median_blur(&enhanced, &mut blurred, 5)?;
-
-            let mut circles = Vector::<Vec3f>::new();
-            // Use loose params to show all candidates
-            let _ = imgproc::hough_circles(
-                &blurred,
-                &mut circles,
-                imgproc::HOUGH_GRADIENT,
-                1.0,
-                8.0,
-                100.0,
-                15.0,
-                MIN_RADIUS,
-                MAX_RADIUS,
-            );
-
-            // Draw all candidates in dim red
-            let dim_red = Scalar::new(0.0, 0.0, 120.0, 0.0);
-            for c in &circles {
-                imgproc::circle(
-                    &mut canvas,
-                    Point::new(c[0] as i32, c[1] as i32),
-                    c[2] as i32,
-                    dim_red,
-                    1,
-                    imgproc::LINE_8,
-                    0,
-                )?;
-            }
-        }
-
-        // Draw selected clock in cyan (thick)
+        // Draw clock in cyan
         let cyan = Scalar::new(255.0, 255.0, 0.0, 0.0);
         imgproc::circle(
             &mut canvas,
@@ -247,22 +337,15 @@ impl Stage for FindFeatures {
             0,
         )?;
 
-        // Draw selected knobs in bright green (thick) with indicator angles
+        // Draw knobs in green with angle indicators in yellow
         let green = Scalar::new(0.0, 255.0, 0.0, 0.0);
         let yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
 
-        // Compute edges for radial scan
-        let mut gray = Mat::default();
-        imgproc::cvt_color_def(&canvas, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-        let mut edges = Mat::default();
-        imgproc::canny(&gray, &mut edges, 10.0, 30.0, 3, false)?;
-
-        for knob in &features.knobs {
+        for (i, knob) in features.knobs.iter().enumerate() {
             let cx = knob.center_x as i32;
             let cy = knob.center_y as i32;
             let r = knob.radius as i32;
 
-            // Draw circle
             imgproc::circle(
                 &mut canvas,
                 Point::new(cx, cy),
@@ -273,24 +356,20 @@ impl Stage for FindFeatures {
                 0,
             )?;
 
-            // Detect indicator angle via radial edge scan
-            if let Ok((angle_deg, strength)) =
-                radial_edge_scan(&edges, cx as u32, cy as u32, r as u32)
-            {
-                if strength > 0.05 {
-                    let rad = angle_deg.to_radians();
-                    let end_x = cx + (r as f64 * rad.cos()) as i32;
-                    let end_y = cy + (r as f64 * rad.sin()) as i32;
-                    imgproc::line(
-                        &mut canvas,
-                        Point::new(cx, cy),
-                        Point::new(end_x, end_y),
-                        yellow,
-                        2,
-                        imgproc::LINE_8,
-                        0,
-                    )?;
-                }
+            // Draw angle indicator
+            if let Some(&angle) = features.off_angles.get(i) {
+                let rad = angle.to_radians();
+                let end_x = cx + (r as f64 * rad.cos()) as i32;
+                let end_y = cy + (r as f64 * rad.sin()) as i32;
+                imgproc::line(
+                    &mut canvas,
+                    Point::new(cx, cy),
+                    Point::new(end_x, end_y),
+                    yellow,
+                    2,
+                    imgproc::LINE_8,
+                    0,
+                )?;
             }
         }
 
@@ -304,255 +383,188 @@ impl Stage for FindFeatures {
     }
 }
 
-/// A scored 10+1 candidate pattern.
-struct PatternCandidate {
-    clock: CircleFeature,
-    knobs: Vec<CircleFeature>,
+/// A single template match result.
+#[derive(Clone)]
+struct TemplateMatch {
+    x: f64,
+    y: f64,
     score: f64,
+    angle: f64,
 }
 
-/// Find the best 10+1 pattern from a pool of circle candidates.
-///
-/// Algorithm:
-/// 1. Compute the median radius of smaller circles (likely knobs).
-/// 2. Partition into "knob-sized" and "clock-sized" buckets.
-/// 3. Among knob-sized circles, find the best Y-aligned subset of 10
-///    with consistent radius and monotonic X-spacing.
-/// 4. Among clock-sized circles, find the one left of the knob row.
-/// 5. Score and return the best configuration.
-fn select_best_pattern(
-    candidates: &[CircleFeature],
-) -> Option<(CircleFeature, Vec<CircleFeature>, f64)> {
-    if candidates.len() < EXPECTED_KNOBS + 1 {
+/// Knob match with center and angle.
+struct KnobMatch {
+    center_x: f64,
+    center_y: f64,
+    angle: f64,
+}
+
+/// Resize a grayscale template to a given scale factor.
+fn resize_template(template: &Mat, scale: f64) -> Result<Mat, opencv::Error> {
+    let mut resized = Mat::default();
+    let new_w = (template.cols() as f64 * scale) as i32;
+    let new_h = (template.rows() as f64 * scale) as i32;
+    if new_w < 3 || new_h < 3 {
+        return Ok(Mat::default());
+    }
+    imgproc::resize(
+        template,
+        &mut resized,
+        Size::new(new_w, new_h),
+        0.0,
+        0.0,
+        imgproc::INTER_AREA,
+    )?;
+    Ok(resized)
+}
+
+/// Rotate a grayscale template by the given angle in degrees.
+fn rotate_template(template: &Mat, angle_deg: f64) -> Result<Mat, opencv::Error> {
+    let cx = template.cols() as f64 / 2.0;
+    let cy = template.rows() as f64 / 2.0;
+    let rot_mat = imgproc::get_rotation_matrix_2d(Point2f::new(cx as f32, cy as f32), -angle_deg, 1.0)?;
+
+    let mut rotated = Mat::default();
+    imgproc::warp_affine(
+        template,
+        &mut rotated,
+        &rot_mat,
+        Size::new(template.cols(), template.rows()),
+        imgproc::INTER_LINEAR,
+        BORDER_CONSTANT,
+        Scalar::default(),
+    )?;
+    Ok(rotated)
+}
+
+/// Find peaks in a matchTemplate result map above the threshold.
+/// Returns matches sorted by score descending.
+fn find_peaks(
+    result: &Mat,
+    threshold: f64,
+    templ_w: i32,
+    templ_h: i32,
+    angle: f64,
+) -> Result<Vec<TemplateMatch>, opencv::Error> {
+    let rows = result.rows();
+    let cols = result.cols();
+    let half_w = templ_w as f64 / 2.0;
+    let half_h = templ_h as f64 / 2.0;
+
+    let mut matches = Vec::new();
+
+    for y in 0..rows {
+        for x in 0..cols {
+            let val = *result.at_2d::<f32>(y, x)? as f64;
+            if val >= threshold {
+                matches.push(TemplateMatch {
+                    x: x as f64 + half_w,
+                    y: y as f64 + half_h,
+                    score: val,
+                    angle,
+                });
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    Ok(matches)
+}
+
+/// Non-maximum suppression: keep the highest-scoring matches, removing
+/// any that are within `min_dist` of a higher-scoring match.
+fn nms(matches: &mut Vec<TemplateMatch>, min_dist: f64) -> Vec<TemplateMatch> {
+    matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    let mut kept: Vec<TemplateMatch> = Vec::new();
+    let min_dist_sq = min_dist * min_dist;
+
+    for m in matches.iter() {
+        let dominated = kept.iter().any(|k| {
+            let dx = m.x - k.x;
+            let dy = m.y - k.y;
+            dx * dx + dy * dy < min_dist_sq
+        });
+        if !dominated {
+            kept.push(m.clone());
+        }
+    }
+
+    kept
+}
+
+/// From NMS'd knob matches, select the best Y-aligned subset of N.
+fn select_y_aligned_knobs(
+    matches: &[TemplateMatch],
+    n: usize,
+    knob_r: f64,
+) -> Option<Vec<KnobMatch>> {
+    if matches.len() < n {
         return None;
     }
 
-    // Sort all by radius to find the knob-size baseline.
-    // The median of the smaller 80% is a robust knob-radius estimate
-    // (ignoring the few large clock candidates).
-    let mut radii: Vec<f64> = candidates.iter().map(|c| c.radius).collect();
-    radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p80_idx = (radii.len() as f64 * 0.8) as usize;
-    let knob_radius_est = radii[p80_idx.min(radii.len() - 1) / 2]; // median of lower 80%
+    // Try each match's Y as a reference, collect the N closest
+    let mut best: Option<(Vec<KnobMatch>, f64)> = None;
 
-    // Partition: knob-sized (within 3x of estimate) and clock-sized (larger)
-    let radius_lo = knob_radius_est * 0.4;
-    let radius_hi = knob_radius_est * 2.5;
-    let clock_min = knob_radius_est * CLOCK_RADIUS_RATIO_MIN;
+    let unique_ys: Vec<f64> = {
+        let mut ys: Vec<f64> = matches.iter().map(|m| m.y).collect();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ys.dedup_by(|a, b| (*a - *b).abs() < 3.0);
+        ys
+    };
 
-    let knob_pool: Vec<&CircleFeature> = candidates
-        .iter()
-        .filter(|c| c.radius >= radius_lo && c.radius <= radius_hi)
-        .collect();
-
-    let clock_pool: Vec<&CircleFeature> = candidates
-        .iter()
-        .filter(|c| c.radius >= clock_min)
-        .collect();
-
-    if knob_pool.len() < EXPECTED_KNOBS || clock_pool.is_empty() {
-        return None;
-    }
-
-    // Find the best Y-aligned subset of 10 knobs.
-    // Strategy: try each possible "reference Y" (each candidate's Y),
-    // collect the 10 closest circles to that Y, score the set.
-    let mut best: Option<PatternCandidate> = None;
-
-    // Collect unique Y values to try as reference (dedup to within 3px)
-    let mut ref_ys: Vec<f64> = knob_pool.iter().map(|c| c.center_y).collect();
-    ref_ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    ref_ys.dedup_by(|a, b| (*a - *b).abs() < 3.0);
-
-    for &ref_y in &ref_ys {
-        // Sort knob-pool by distance from ref_y
-        let mut by_y_dist: Vec<(&CircleFeature, f64)> = knob_pool
+    for &ref_y in &unique_ys {
+        let mut by_y: Vec<&TemplateMatch> = matches
             .iter()
-            .map(|c| (*c, (c.center_y - ref_y).abs()))
-            .collect();
-        by_y_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-        // Take the closest candidates (up to 15) and find the best 10 among them
-        let close: Vec<&CircleFeature> = by_y_dist
-            .iter()
-            .take(15)
-            .map(|(c, _)| *c)
+            .filter(|m| (m.y - ref_y).abs() < knob_r * 3.0)
             .collect();
 
-        if close.len() < EXPECTED_KNOBS {
+        if by_y.len() < n {
             continue;
         }
 
-        // Sort by X for monotonic-spacing check
-        let mut sorted_x: Vec<&CircleFeature> = close.clone();
-        sorted_x.sort_by(|a, b| a.center_x.partial_cmp(&b.center_x).unwrap());
+        // Sort by X
+        by_y.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
 
-        // Greedy: pick 10 with best radius consistency from the X-sorted list
-        // Remove outliers by radius first
-        let median_r = {
-            let mut rs: Vec<f64> = sorted_x.iter().map(|c| c.radius).collect();
-            rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            rs[rs.len() / 2]
-        };
-
-        let radius_filtered: Vec<&CircleFeature> = sorted_x
-            .into_iter()
-            .filter(|c| {
-                c.radius >= median_r * 0.5 && c.radius <= median_r * 2.0
-            })
-            .collect();
-
-        if radius_filtered.len() < EXPECTED_KNOBS {
-            continue;
-        }
-
-        // If more than 10, try all combinations of dropping extras.
-        // For efficiency, just take the 10 most Y-aligned.
-        let mut knobs: Vec<CircleFeature> = radius_filtered
-            .iter()
-            .map(|c| (*c).clone())
-            .collect();
-        if knobs.len() > EXPECTED_KNOBS {
-            knobs.sort_by(|a, b| {
-                let da = (a.center_y - ref_y).abs();
-                let db = (b.center_y - ref_y).abs();
-                da.partial_cmp(&db).unwrap()
-            });
-            knobs.truncate(EXPECTED_KNOBS);
-        }
+        // Take the best N by score among those that are Y-close
+        let mut by_score: Vec<&TemplateMatch> = by_y.clone();
+        by_score.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        by_score.truncate(n);
 
         // Re-sort by X
-        knobs.sort_by(|a, b| a.center_x.partial_cmp(&b.center_x).unwrap());
+        by_score.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
 
-        // --- Hard rejection based on reference proportions ---
-
-        // Reject if knob radii are too inconsistent
-        let mean_r: f64 = knobs.iter().map(|k| k.radius).sum::<f64>() / knobs.len() as f64;
-        let var_r: f64 = knobs.iter().map(|k| (k.radius - mean_r).powi(2)).sum::<f64>()
-            / knobs.len() as f64;
-        let cv_r = var_r.sqrt() / mean_r.max(1.0);
-        if cv_r > MAX_RADIUS_CV {
+        // Check monotonic X with min gap
+        let mut ok = true;
+        for i in 1..by_score.len() {
+            if by_score[i].x - by_score[i - 1].x < 5.0 {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
             continue;
         }
 
-        // Reject if X spacing is too irregular
-        let mut gaps: Vec<f64> = Vec::new();
-        for i in 1..knobs.len() {
-            gaps.push(knobs[i].center_x - knobs[i - 1].center_x);
-        }
-        let mean_gap: f64 = gaps.iter().sum::<f64>() / gaps.len() as f64;
-        let var_gap: f64 =
-            gaps.iter().map(|g| (g - mean_gap).powi(2)).sum::<f64>() / gaps.len() as f64;
-        let cv_gap = var_gap.sqrt() / mean_gap.max(1.0);
-        if cv_gap > MAX_SPACING_CV {
-            continue;
-        }
+        // Score: Y-variance (lower is better)
+        let mean_y: f64 = by_score.iter().map(|m| m.y).sum::<f64>() / n as f64;
+        let y_var: f64 =
+            by_score.iter().map(|m| (m.y - mean_y).powi(2)).sum::<f64>() / n as f64;
+        let y_score = 1.0 / (1.0 + y_var);
 
-        // Reject if any gap is negative or very small (non-monotonic)
-        let min_gap = gaps.iter().cloned().fold(f64::INFINITY, f64::min);
-        if min_gap < 5.0 {
-            continue;
-        }
-
-        let knob_score = score_knob_set(&knobs);
-
-        // --- Clock selection with reference-based constraints ---
-        let leftmost_knob_x = knobs[0].center_x;
-        let knob_median_y = {
-            let mut ys: Vec<f64> = knobs.iter().map(|k| k.center_y).collect();
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            ys[ys.len() / 2]
-        };
-
-        // Clock must be: left of knob row, correct radius ratio, same Y row
-        let y_tol = mean_r * CLOCK_Y_TOLERANCE_RADII;
-        let mut clock_candidates: Vec<(&CircleFeature, f64)> = clock_pool
-            .iter()
-            .filter(|c| {
-                // Must be left of the knob row
-                c.center_x < leftmost_knob_x
-                // Radius must be in the expected range relative to knobs
-                && c.radius >= mean_r * CLOCK_RADIUS_RATIO_MIN
-                && c.radius <= mean_r * CLOCK_RADIUS_RATIO_MAX
-                // Must be at the same Y height as the knob row
-                && (c.center_y - knob_median_y).abs() <= y_tol
-            })
-            .map(|c| {
-                let r_ratio = c.radius / mean_r;
-                // Ideal ratio is ~1.9 from the Boretti reference photo
-                let r_score = 1.0 - ((r_ratio - 1.9).abs() / 1.0).min(1.0);
-                let y_dist = (c.center_y - knob_median_y).abs();
-                let y_score = 1.0 - (y_dist / y_tol).min(1.0);
-                (*c, r_score * 0.5 + y_score * 0.5)
-            })
-            .collect();
-
-        if clock_candidates.is_empty() {
-            continue;
-        }
-
-        clock_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let clock = clock_candidates[0].0.clone();
-        let clock_score = clock_candidates[0].1;
-
-        let total_score = knob_score * 0.8 + clock_score * 0.2;
-
-        let dominated = best.as_ref().is_some_and(|b| b.score >= total_score);
-        if !dominated {
-            best = Some(PatternCandidate {
-                clock,
-                knobs,
-                score: total_score,
-            });
+        let is_better = best.as_ref().is_none_or(|(_, s)| y_score > *s);
+        if is_better {
+            let knobs = by_score
+                .iter()
+                .map(|m| KnobMatch {
+                    center_x: m.x,
+                    center_y: m.y,
+                    angle: m.angle,
+                })
+                .collect();
+            best = Some((knobs, y_score));
         }
     }
 
-    best.map(|b| (b.clock, b.knobs, b.score))
-}
-
-/// Score a set of 10 knobs. Higher is better.
-///
-/// Based on the Boretti Toscana reference:
-///   - Y alignment is the dominant signal (knobs share an exact Y)
-///   - Radius consistency is strong (identical hardware)
-///   - X spacing has 3 groups so we only check monotonic + min gap, not uniformity
-fn score_knob_set(knobs: &[CircleFeature]) -> f64 {
-    if knobs.len() < 2 {
-        return 0.0;
-    }
-
-    // Y alignment: normalised inverse of max Y-deviation from median.
-    // This is THE strongest constraint — knobs are manufactured at the same height.
-    let mut ys: Vec<f64> = knobs.iter().map(|k| k.center_y).collect();
-    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median_y = ys[ys.len() / 2];
-    let max_y_dev = ys.iter().map(|y| (y - median_y).abs()).fold(0.0f64, f64::max);
-    let y_score = 1.0 - (max_y_dev / 20.0).min(1.0); // 20px = worst acceptable
-
-    // Radius consistency: inverse of coefficient of variation.
-    // All 10 knobs are identical hardware — radii must be very consistent.
-    let mean_r: f64 = knobs.iter().map(|k| k.radius).sum::<f64>() / knobs.len() as f64;
-    let var_r: f64 = knobs.iter().map(|k| (k.radius - mean_r).powi(2)).sum::<f64>()
-        / knobs.len() as f64;
-    let cv_r = var_r.sqrt() / mean_r.max(1.0);
-    let r_score = 1.0 - cv_r.min(1.0);
-
-    // X monotonicity: just check all gaps are positive and above minimum.
-    // Don't penalise uneven spacing — the Boretti has 3 control groups with
-    // wider gaps between groups (~1.5× the within-group spacing).
-    let mut gaps: Vec<f64> = Vec::new();
-    for i in 1..knobs.len() {
-        gaps.push(knobs[i].center_x - knobs[i - 1].center_x);
-    }
-    let min_gap = gaps.iter().cloned().fold(f64::INFINITY, f64::min);
-    if min_gap < 5.0 {
-        return 0.0; // non-monotonic or overlapping → reject
-    }
-
-    // Mild bonus for reasonable total span (knobs should cover a wide area)
-    let span = knobs.last().unwrap().center_x - knobs.first().unwrap().center_x;
-    let span_score = (span / 200.0).min(1.0); // normalise: 200px+ = full score
-
-    // Weights: Y alignment dominates, radius consistency secondary, span tertiary
-    0.55 * y_score + 0.35 * r_score + 0.10 * span_score
+    best.map(|(k, _)| k)
 }

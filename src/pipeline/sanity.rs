@@ -10,7 +10,7 @@ use super::stage::{PipelineState, StageId, StageOutcome};
 
 /// Maximum allowed Y-deviation (pixels) between any knob center and the
 /// median knob Y. If any knob exceeds this, perspective correction is off.
-const Y_TOLERANCE_PX: f64 = 10.0;
+const Y_TOLERANCE_PX: f64 = 25.0;
 
 /// Minimum X-gap (pixels) between consecutive knob centers. Knobs closer
 /// than this are likely duplicates or false positives.

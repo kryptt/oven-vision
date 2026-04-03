@@ -3,7 +3,7 @@ set -euo pipefail
 
 REGISTRY=registry.hr-home.xyz
 APP=oven-vision
-VERSION=2.0.3
+VERSION=2.1.0
 
 IMG=$REGISTRY/$APP:$VERSION
 LATEST=$REGISTRY/$APP:latest

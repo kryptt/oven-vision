@@ -42,6 +42,7 @@ FROM alpine:3.21
 RUN apk add --no-cache opencv libstdc++
 
 COPY --from=release /build/target/release/oven-vision /usr/local/bin/oven-vision
+COPY templates/ /templates/
 
 EXPOSE 8080
 
