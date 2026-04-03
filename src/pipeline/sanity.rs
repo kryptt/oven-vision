@@ -113,7 +113,26 @@ impl Stage for SanityCheck {
             }
         }
 
-        // Check 3b: X-gap regularity — spacing should be approximately even.
+        // Check 3b: no overlapping knobs — distance between any two knob
+        // centers must be greater than the sum of their radii.
+        for i in 0..features.knobs.len() {
+            for j in (i + 1)..features.knobs.len() {
+                let dx = features.knobs[j].center_x - features.knobs[i].center_x;
+                let dy = features.knobs[j].center_y - features.knobs[i].center_y;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let min_dist = features.knobs[i].radius + features.knobs[j].radius;
+                if dist < min_dist {
+                    return Ok((
+                        StageOutcome::Exhausted(format!(
+                            "knobs {i}/{j} overlap: dist={dist:.1}px < radii_sum={min_dist:.1}px"
+                        )),
+                        ImageOutput::Passthrough,
+                    ));
+                }
+            }
+        }
+
+        // Check 3c: X-gap regularity — spacing should be approximately even.
         // The Boretti has 3 control groups with wider gaps between them, so
         // we allow moderate variation but reject wildly uneven spacing.
         {
