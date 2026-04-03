@@ -3,7 +3,7 @@ use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{CropRegion, PipelineState, StageDescriptor, StageOutcome};
-use super::{DebugImage, Stage};
+use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
 /// Default crop region covering the stove panel with generous margins.
@@ -70,60 +70,70 @@ impl Stage for FindStove {
     fn run(
         &self,
         state: &mut PipelineState,
-        frame: &Mat,
+        _src: &Mat,
+        dst: &mut Mat,
+        raw: &Mat,
         iteration: u32,
-    ) -> Result<StageOutcome, opencv::Error> {
-        let frame_w = frame.cols() as u32;
-        let frame_h = frame.rows() as u32;
+    ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
+        let frame_w = raw.cols() as u32;
+        let frame_h = raw.rows() as u32;
 
         if frame_w == 0 || frame_h == 0 {
-            return Ok(StageOutcome::Exhausted("empty frame (0×0)".into()));
+            return Ok((
+                StageOutcome::Exhausted("empty frame (0x0)".into()),
+                ImageOutput::Passthrough,
+            ));
         }
 
         let crop = self.crop_for_iteration(iteration, frame_w, frame_h);
 
         // Validate the crop fits within the frame
         if crop.x + crop.width > frame_w || crop.y + crop.height > frame_h {
-            return Ok(StageOutcome::Retry(format!(
-                "crop {}x{}+{}+{} exceeds frame {}x{}",
-                crop.width, crop.height, crop.x, crop.y, frame_w, frame_h
-            )));
-        }
-
-        if crop.width < 100 || crop.height < 50 {
-            return Ok(StageOutcome::Exhausted(
-                "crop region too small for meaningful detection".into(),
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "crop {}x{}+{}+{} exceeds frame {}x{}",
+                    crop.width, crop.height, crop.x, crop.y, frame_w, frame_h
+                )),
+                ImageOutput::Passthrough,
             ));
         }
 
-        // Extract the ROI — opencv::core::Mat::roi returns a sub-matrix view
+        if crop.width < 100 || crop.height < 50 {
+            return Ok((
+                StageOutcome::Exhausted("crop region too small for meaningful detection".into()),
+                ImageOutput::Passthrough,
+            ));
+        }
+
+        // Extract the ROI and copy to dst
         let roi = Rect::new(
             crop.x as i32,
             crop.y as i32,
             crop.width as i32,
             crop.height as i32,
         );
-        // Verify the ROI is valid by creating the sub-mat (this clones the data)
-        let _cropped = Mat::roi(frame, roi)?;
+        let cropped = Mat::roi(raw, roi)?;
+        cropped.copy_to(dst)?;
 
         state.crop = Some(crop);
-        Ok(StageOutcome::Success)
+        Ok((StageOutcome::Success, ImageOutput::Transformed))
     }
 
     fn max_retries(&self) -> u32 {
-        20 // 20 × 20px = 400px max expansion
+        20 // 20 x 20px = 400px max expansion
     }
 
     fn debug_image(
         &self,
         state: &PipelineState,
-        frame: &Mat,
+        _working: &Mat,
+        raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
         let Some(crop) = &state.crop else {
             return Ok(None);
         };
 
-        let mut canvas = frame.clone();
+        let mut canvas = raw.try_clone()?;
         let rect = Rect::new(
             crop.x as i32,
             crop.y as i32,

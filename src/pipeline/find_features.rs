@@ -1,19 +1,16 @@
-use opencv::core::{
-    BORDER_CONSTANT, Mat, MatTraitConst, Point, Point2f, Rect, Scalar, Size, Vector,
-};
+use opencv::core::{BORDER_CONSTANT, Mat, MatTraitConst, Point, Point2f, Scalar, Size};
 use opencv::imgcodecs;
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use super::perspective::transform_to_mat;
 use super::stage::{CircleFeature, DetectedFeatures, PipelineState, StageDescriptor, StageOutcome};
-use super::{DebugImage, Stage};
+use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
 /// Expected knob count (excluding the clock).
 const EXPECTED_KNOBS: usize = 10;
 
-/// Template matching threshold (TM_CCOEFF_NORMED). Matches below this are ignored.
+/// Template matching threshold (TM_CCORR_NORMED). Matches below this are ignored.
 const MATCH_THRESHOLD: f64 = 0.35;
 
 /// Minimum distance between two accepted match positions (pixels in warped image).
@@ -31,28 +28,59 @@ const ROTATION_STEP_DEG: f64 = 10.0;
 const KNOB_TEMPLATE_PATH: &str = "/templates/knob.jpg";
 const CLOCK_TEMPLATE_PATH: &str = "/templates/clock.jpg";
 
-/// Stage 4: Detect features using multi-scale, multi-rotation template matching.
+/// Stage 8: Detect features using multi-scale, multi-rotation template matching.
 ///
 /// Uses reference photos of the actual knob and clock to find their positions
-/// in the perspective-corrected image. Each knob match also yields the handle
+/// in the knob area (right of clock). Each knob match also yields the handle
 /// angle directly (the rotation that scored highest).
+///
+/// Coordinates are translated back using stored offsets from FindClock and
+/// ExtractBand.
 pub struct FindFeatures {
+    /// Knob template with CLAHE already applied (done once at construction).
     knob_template: Mat,
+    /// Clock template with CLAHE already applied (done once at construction).
     clock_template: Mat,
 }
 
 impl FindFeatures {
     pub fn new() -> Self {
-        let knob_template = imgcodecs::imread(KNOB_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
-            .unwrap_or_else(|e| {
-                tracing::warn!(%e, path = KNOB_TEMPLATE_PATH, "failed to load knob template, using empty");
-                Mat::default()
-            });
-        let clock_template = imgcodecs::imread(CLOCK_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
-            .unwrap_or_else(|e| {
-                tracing::warn!(%e, path = CLOCK_TEMPLATE_PATH, "failed to load clock template, using empty");
-                Mat::default()
-            });
+        let mut clahe = imgproc::create_clahe(3.0, Size::new(8, 8)).unwrap();
+
+        let knob_template = {
+            let raw = imgcodecs::imread(KNOB_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(%e, path = KNOB_TEMPLATE_PATH, "failed to load knob template, using empty");
+                    Mat::default()
+                });
+            if raw.empty() {
+                raw
+            } else {
+                let mut enhanced = Mat::default();
+                clahe.apply(&raw, &mut enhanced).unwrap_or_else(|e| {
+                    tracing::warn!(%e, "failed to apply CLAHE to knob template");
+                });
+                if enhanced.empty() { raw } else { enhanced }
+            }
+        };
+
+        let clock_template = {
+            let raw = imgcodecs::imread(CLOCK_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(%e, path = CLOCK_TEMPLATE_PATH, "failed to load clock template, using empty");
+                    Mat::default()
+                });
+            if raw.empty() {
+                raw
+            } else {
+                let mut enhanced = Mat::default();
+                clahe.apply(&raw, &mut enhanced).unwrap_or_else(|e| {
+                    tracing::warn!(%e, "failed to apply CLAHE to clock template");
+                });
+                if enhanced.empty() { raw } else { enhanced }
+            }
+        };
+
         Self {
             knob_template,
             clock_template,
@@ -62,7 +90,7 @@ impl FindFeatures {
 
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     name: "FindFeatures",
-    label: "S4:FindFeatures",
+    label: "S8:FindFeatures",
     fallback: Some("FindClock"),
 };
 
@@ -74,61 +102,45 @@ impl Stage for FindFeatures {
     fn run(
         &self,
         state: &mut PipelineState,
-        frame: &Mat,
+        src: &Mat,
+        _dst: &mut Mat,
+        _raw: &Mat,
         iteration: u32,
-    ) -> Result<StageOutcome, opencv::Error> {
-        let (Some(crop), Some(persp)) = (&state.crop, &state.perspective) else {
-            return Ok(StageOutcome::Exhausted(
-                "missing crop or perspective from previous stages".into(),
+    ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
+        if self.knob_template.empty() || self.clock_template.empty() {
+            return Ok((
+                StageOutcome::Exhausted("template images not loaded".into()),
+                ImageOutput::Passthrough,
+            ));
+        }
+
+        let Some(search) = &state.knob_search else {
+            return Ok((
+                StageOutcome::Exhausted("missing knob search area".into()),
+                ImageOutput::Passthrough,
             ));
         };
 
-        if self.knob_template.empty() || self.clock_template.empty() {
-            return Ok(StageOutcome::Exhausted("template images not loaded".into()));
-        }
-
-        // Warp the cropped frame
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let cropped = Mat::roi(frame, roi_rect)?;
-        let mat = transform_to_mat(&persp.matrix)?;
-
-        let mut warped = Mat::default();
-        imgproc::warp_perspective_def(
-            &cropped,
-            &mut warped,
-            &mat,
-            Size::new(persp.output_width as i32, persp.output_height as i32),
-        )?;
-
-        // Use the knob search area from ExtractBand + FindClock stages
-        let (knob_y_min, knob_y_max, knob_x_min) = match &state.knob_search {
-            Some(ks) => (ks.y_min, ks.y_max, ks.x_min),
-            None => {
-                // Fallback if stages didn't run
-                let img_h = persp.output_height as f64;
-                (img_h * 0.10, img_h * 0.45, 0.0)
-            }
-        };
+        // src is the knob area (right of clock) from FindClock
+        let x_offset = search.x_min; // offset to translate back to band coords
+        let y_offset = search.y_min; // offset to translate back to warped-image coords
 
         // Convert to grayscale
         let mut gray = Mat::default();
-        imgproc::cvt_color_def(&warped, &mut gray, imgproc::COLOR_BGR2GRAY)?;
+        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
 
         // Enhance contrast
         let mut enhanced = Mat::default();
-        let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
+        let mut clahe = imgproc::create_clahe(3.0, Size::new(8, 8))?;
         clahe.apply(&gray, &mut enhanced)?;
 
-        // Color-invert: chrome knobs on dark panel → dark knobs on bright panel.
-        // This makes the knob ring a strong dark feature that template-matches better
-        // against the inverted reference photo.
-        let mut inverted = Mat::default();
-        opencv::core::bitwise_not(&enhanced, &mut inverted, &Mat::default())?;
+        // Median blur before edge detection
+        let mut blurred = Mat::default();
+        imgproc::median_blur(&enhanced, &mut blurred, 3)?;
+
+        // Edge detection on the working image
+        let mut edge_img = Mat::default();
+        imgproc::canny(&blurred, &mut edge_img, 50.0, 150.0, 3, false)?;
 
         // Pick scale based on iteration (cycle through scales, then repeat with lower threshold)
         let scale_idx = (iteration as usize) % SCALE_FACTORS.len();
@@ -136,103 +148,107 @@ impl Stage for FindFeatures {
         let threshold_adj = (iteration as usize / SCALE_FACTORS.len()) as f64 * 0.05;
         let threshold = (MATCH_THRESHOLD - threshold_adj).max(0.15);
 
-        // --- Find knobs: multi-rotation template matching ---
+        // --- Find knobs: multi-rotation edge-based template matching ---
         let scaled_knob = resize_template(&self.knob_template, scale)?;
         if scaled_knob.cols() < 5 || scaled_knob.rows() < 5 {
-            return Ok(StageOutcome::Retry(format!(
-                "knob template too small at scale {scale:.2}"
-            )));
+            return Ok((
+                StageOutcome::Retry(format!("knob template too small at scale {scale:.2}")),
+                ImageOutput::Passthrough,
+            ));
         }
-
-        // Enhance + invert the template to match the inverted image
-        let mut knob_enhanced = Mat::default();
-        clahe.apply(&scaled_knob, &mut knob_enhanced)?;
-        let mut knob_inv = Mat::default();
-        opencv::core::bitwise_not(&knob_enhanced, &mut knob_inv, &Mat::default())?;
 
         let mut all_knob_matches: Vec<TemplateMatch> = Vec::new();
 
         let n_rotations = (360.0 / ROTATION_STEP_DEG) as i32;
         for rot_idx in 0..n_rotations {
             let angle = rot_idx as f64 * ROTATION_STEP_DEG;
-            let rotated = rotate_template(&knob_inv, angle)?;
+            let rotated = rotate_template(&scaled_knob, angle)?;
             if rotated.empty() {
                 continue;
             }
 
+            // Apply Canny to the rotated template (after scale and rotation)
+            let mut edge_templ = Mat::default();
+            imgproc::canny(&rotated, &mut edge_templ, 50.0, 150.0, 3, false)?;
+
             // Skip if template is larger than image
-            if rotated.cols() >= inverted.cols() || rotated.rows() >= inverted.rows() {
+            if edge_templ.cols() >= edge_img.cols() || edge_templ.rows() >= edge_img.rows() {
                 continue;
             }
 
             let mut result = Mat::default();
             imgproc::match_template(
-                &inverted,
-                &rotated,
+                &edge_img,
+                &edge_templ,
                 &mut result,
-                imgproc::TM_CCOEFF_NORMED,
+                imgproc::TM_CCORR_NORMED,
                 &Mat::default(),
             )?;
 
             // Find peaks above threshold
-            let matches = find_peaks(&result, threshold, rotated.cols(), rotated.rows(), angle)?;
+            let matches = find_peaks(
+                &result,
+                threshold,
+                edge_templ.cols(),
+                edge_templ.rows(),
+                angle,
+            )?;
             all_knob_matches.extend(matches);
         }
 
-        // Filter to knob search area (Y-band + right of clock)
-        all_knob_matches.retain(|m| m.y >= knob_y_min && m.y <= knob_y_max && m.x >= knob_x_min);
-
         if all_knob_matches.len() < EXPECTED_KNOBS {
-            return Ok(StageOutcome::Retry(format!(
-                "found {} knob matches in Y-band [{knob_y_min:.0}..{knob_y_max:.0}] (need {}), scale={scale:.2}, threshold={threshold:.2}",
-                all_knob_matches.len(),
-                EXPECTED_KNOBS
-            )));
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "found {} knob matches (need {}), scale={scale:.2}, threshold={threshold:.2}",
+                    all_knob_matches.len(),
+                    EXPECTED_KNOBS
+                )),
+                ImageOutput::Passthrough,
+            ));
         }
 
         // NMS: keep best non-overlapping matches
         let knob_results = nms(&mut all_knob_matches, NMS_MIN_DIST);
 
         if knob_results.len() < EXPECTED_KNOBS {
-            return Ok(StageOutcome::Retry(format!(
-                "only {} knob matches after NMS (need {}), scale={scale:.2}",
-                knob_results.len(),
-                EXPECTED_KNOBS
-            )));
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "only {} knob matches after NMS (need {}), scale={scale:.2}",
+                    knob_results.len(),
+                    EXPECTED_KNOBS
+                )),
+                ImageOutput::Passthrough,
+            ));
         }
 
-        // --- Find clock: scale-only matching (no rotation) ---
+        // --- Find clock: scale-only edge-based matching (no rotation) ---
         let scaled_clock = resize_template(&self.clock_template, scale)?;
         let mut clock_match: Option<TemplateMatch> = None;
 
         if scaled_clock.cols() >= 5
             && scaled_clock.rows() >= 5
-            && scaled_clock.cols() < inverted.cols()
-            && scaled_clock.rows() < inverted.rows()
+            && scaled_clock.cols() < edge_img.cols()
+            && scaled_clock.rows() < edge_img.rows()
         {
-            let mut clock_enhanced = Mat::default();
-            clahe.apply(&scaled_clock, &mut clock_enhanced)?;
-            let mut clock_inv = Mat::default();
-            opencv::core::bitwise_not(&clock_enhanced, &mut clock_inv, &Mat::default())?;
+            let mut edge_clock = Mat::default();
+            imgproc::canny(&scaled_clock, &mut edge_clock, 50.0, 150.0, 3, false)?;
 
             let mut result = Mat::default();
             imgproc::match_template(
-                &inverted,
-                &clock_inv,
+                &edge_img,
+                &edge_clock,
                 &mut result,
-                imgproc::TM_CCOEFF_NORMED,
+                imgproc::TM_CCORR_NORMED,
                 &Mat::default(),
             )?;
 
-            let mut peaks = find_peaks(
+            let peaks = find_peaks(
                 &result,
                 threshold,
                 scaled_clock.cols(),
                 scaled_clock.rows(),
                 0.0,
             )?;
-            // Clock should also be in the knob Y-band
-            peaks.retain(|m| m.y >= knob_y_min && m.y <= knob_y_max);
             if !peaks.is_empty() {
                 clock_match = Some(peaks[0].clone());
             }
@@ -254,32 +270,37 @@ impl Stage for FindFeatures {
         let selected = select_y_aligned_knobs(&sorted_knobs, EXPECTED_KNOBS, knob_r);
 
         let Some(knobs) = selected else {
-            return Ok(StageOutcome::Retry(format!(
-                "could not find {EXPECTED_KNOBS} Y-aligned knob matches, scale={scale:.2}"
-            )));
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "could not find {EXPECTED_KNOBS} Y-aligned knob matches, scale={scale:.2}"
+                )),
+                ImageOutput::Passthrough,
+            ));
         };
 
-        // Determine clock
+        // Translate coordinates back to warped-image space
         let knob_median_y = {
-            let mut ys: Vec<f64> = knobs.iter().map(|k| k.center_y).collect();
+            let mut ys: Vec<f64> = knobs.iter().map(|k| k.center_y + y_offset).collect();
             ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             ys[ys.len() / 2]
         };
         let leftmost_knob_x = knobs
             .iter()
-            .map(|k| k.center_x)
+            .map(|k| k.center_x + x_offset)
             .fold(f64::INFINITY, f64::min);
 
         let clock = if let Some(cm) = clock_match {
+            let cm_x = cm.x + x_offset;
+            let cm_y = cm.y + y_offset;
             // Validate clock is left of knobs and near the same Y
-            if cm.x < leftmost_knob_x && (cm.y - knob_median_y).abs() < knob_r * 4.0 {
+            if cm_x < leftmost_knob_x && (cm_y - knob_median_y).abs() < knob_r * 4.0 {
                 CircleFeature {
-                    center_x: cm.x,
-                    center_y: cm.y,
+                    center_x: cm_x,
+                    center_y: cm_y,
                     radius: clock_r,
                 }
             } else {
-                // Clock match in wrong position — synthesize from knob row
+                // Clock match in wrong position -- synthesize from knob row
                 CircleFeature {
                     center_x: leftmost_knob_x - knob_r * 4.0,
                     center_y: knob_median_y,
@@ -287,7 +308,7 @@ impl Stage for FindFeatures {
                 }
             }
         } else {
-            // No clock match — estimate position from knob row
+            // No clock match -- estimate position from knob row
             CircleFeature {
                 center_x: leftmost_knob_x - knob_r * 4.0,
                 center_y: knob_median_y,
@@ -303,15 +324,15 @@ impl Stage for FindFeatures {
             knobs: knobs
                 .iter()
                 .map(|k| CircleFeature {
-                    center_x: k.center_x,
-                    center_y: k.center_y,
+                    center_x: k.center_x + x_offset,
+                    center_y: k.center_y + y_offset,
                     radius: knob_r,
                 })
                 .collect(),
             off_angles,
         });
 
-        Ok(StageOutcome::Success)
+        Ok((StageOutcome::Success, ImageOutput::Passthrough))
     }
 
     fn max_retries(&self) -> u32 {
@@ -321,53 +342,28 @@ impl Stage for FindFeatures {
     fn debug_image(
         &self,
         state: &PipelineState,
-        frame: &Mat,
+        working: &Mat,
+        _raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let (Some(crop), Some(persp), Some(features)) =
-            (&state.crop, &state.perspective, &state.features)
-        else {
+        let Some(features) = &state.features else {
             return Ok(None);
         };
 
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let cropped = Mat::roi(frame, roi_rect)?;
-        let mat = transform_to_mat(&persp.matrix)?;
+        let search = state.knob_search.as_ref();
+        let x_offset = search.map(|s| s.x_min).unwrap_or(0.0);
+        let y_offset = search.map(|s| s.y_min).unwrap_or(0.0);
 
-        let mut canvas = Mat::default();
-        imgproc::warp_perspective_def(
-            &cropped,
-            &mut canvas,
-            &mat,
-            Size::new(persp.output_width as i32, persp.output_height as i32),
-        )?;
-
-        // Draw clock in cyan
-        let cyan = Scalar::new(255.0, 255.0, 0.0, 0.0);
-        imgproc::circle(
-            &mut canvas,
-            Point::new(
-                features.clock.center_x as i32,
-                features.clock.center_y as i32,
-            ),
-            features.clock.radius as i32,
-            cyan,
-            2,
-            imgproc::LINE_8,
-            0,
-        )?;
+        // working is the knob area; draw features translated to local coords
+        let mut canvas = working.try_clone()?;
 
         // Draw knobs in green with angle indicators in yellow
         let green = Scalar::new(0.0, 255.0, 0.0, 0.0);
         let yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
 
         for (i, knob) in features.knobs.iter().enumerate() {
-            let cx = knob.center_x as i32;
-            let cy = knob.center_y as i32;
+            // Translate from warped-image coords back to local knob-area coords
+            let cx = (knob.center_x - x_offset) as i32;
+            let cy = (knob.center_y - y_offset) as i32;
             let r = knob.radius as i32;
 
             imgproc::circle(
@@ -399,7 +395,7 @@ impl Stage for FindFeatures {
 
         let n_knobs = features.knobs.len();
         let label = format!(
-            "S4:FindFeatures_{}k_clk{:.0}",
+            "S8:FindFeatures_{}k_clk{:.0}",
             n_knobs, features.clock.center_x
         );
         let jpeg = encode_jpeg(&canvas, 80)?;

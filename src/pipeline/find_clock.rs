@@ -3,9 +3,8 @@ use opencv::imgcodecs;
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use super::perspective::transform_to_mat;
 use super::stage::{PipelineState, StageDescriptor, StageOutcome};
-use super::{DebugImage, Stage};
+use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
 /// Scale factors for clock template matching.
@@ -17,11 +16,12 @@ const CLOCK_THRESHOLD: f64 = 0.25;
 /// Path to the clock template.
 const CLOCK_TEMPLATE_PATH: &str = "/templates/clock.jpg";
 
-/// Stage 3c: Find the analog clock in the extracted band.
+/// Stage 7: Find the analog clock in the extracted band.
 ///
 /// The clock is the leftmost large feature on the panel. Its right edge
-/// defines the start of the knob area. This stage updates `knob_search.x_min`
-/// so that S4 only looks for knobs to the right of the clock.
+/// defines the start of the knob area. This stage reads `src` (the band),
+/// finds the clock, and copies the region right of the clock into `dst`.
+/// It also stores the x_offset in state for coordinate translation.
 pub struct FindClock {
     template: Mat,
 }
@@ -39,7 +39,7 @@ impl FindClock {
 
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     name: "FindClock",
-    label: "S3c:FindClock",
+    label: "S7:FindClock",
     fallback: Some("ExtractBand"),
 };
 
@@ -51,51 +51,37 @@ impl Stage for FindClock {
     fn run(
         &self,
         state: &mut PipelineState,
-        frame: &Mat,
+        src: &Mat,
+        dst: &mut Mat,
+        _raw: &Mat,
         iteration: u32,
-    ) -> Result<StageOutcome, opencv::Error> {
-        let (Some(crop), Some(persp), Some(search)) =
-            (&state.crop, &state.perspective, &state.knob_search)
-        else {
-            return Ok(StageOutcome::Exhausted("missing prior state".into()));
+    ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
+        let Some(search) = &state.knob_search else {
+            return Ok((
+                StageOutcome::Exhausted("missing prior state".into()),
+                ImageOutput::Passthrough,
+            ));
         };
 
         if self.template.empty() {
-            return Ok(StageOutcome::Exhausted("clock template not loaded".into()));
+            return Ok((
+                StageOutcome::Exhausted("clock template not loaded".into()),
+                ImageOutput::Passthrough,
+            ));
         }
 
-        // Warp frame and extract the band
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let cropped = Mat::roi(frame, roi_rect)?;
-        let mat = transform_to_mat(&persp.matrix)?;
-
-        let mut warped = Mat::default();
-        imgproc::warp_perspective_def(
-            &cropped,
-            &mut warped,
-            &mat,
-            Size::new(persp.output_width as i32, persp.output_height as i32),
-        )?;
-
-        let band_rect = Rect::new(
-            0,
-            search.y_min as i32,
-            persp.output_width as i32,
-            (search.y_max - search.y_min) as i32,
-        );
-        let band = Mat::roi(&warped, band_rect)?;
+        // src is the band image from ExtractBand
 
         // Convert to grayscale + enhance
         let mut gray = Mat::default();
-        imgproc::cvt_color_def(&band, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-        let mut clahe_obj = imgproc::create_clahe(2.0, Size::new(8, 8))?;
+        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
+        let mut clahe_obj = imgproc::create_clahe(3.0, Size::new(8, 8))?;
         let mut enhanced = Mat::default();
         clahe_obj.apply(&gray, &mut enhanced)?;
+
+        // Median blur before edge detection
+        let mut blurred = Mat::default();
+        imgproc::median_blur(&enhanced, &mut blurred, 3)?;
 
         // Pick scale from iteration
         let scale_idx = (iteration as usize) % SCALE_FACTORS.len();
@@ -105,9 +91,10 @@ impl Stage for FindClock {
         let new_w = (self.template.cols() as f64 * scale) as i32;
         let new_h = (self.template.rows() as f64 * scale) as i32;
         if new_w < 5 || new_h < 5 {
-            return Ok(StageOutcome::Retry(format!(
-                "clock template too small at scale {scale:.2}"
-            )));
+            return Ok((
+                StageOutcome::Retry(format!("clock template too small at scale {scale:.2}")),
+                ImageOutput::Passthrough,
+            ));
         }
         let mut scaled = Mat::default();
         imgproc::resize(
@@ -119,32 +106,33 @@ impl Stage for FindClock {
             imgproc::INTER_AREA,
         )?;
 
-        // Enhance + invert both
-        let mut templ_enhanced = Mat::default();
-        clahe_obj.apply(&scaled, &mut templ_enhanced)?;
+        // Edge-based template matching: apply Canny to both image and template
+        let mut edge_img = Mat::default();
+        imgproc::canny(&blurred, &mut edge_img, 50.0, 150.0, 3, false)?;
 
-        let mut img_inv = Mat::default();
-        opencv::core::bitwise_not(&enhanced, &mut img_inv, &Mat::default())?;
-        let mut templ_inv = Mat::default();
-        opencv::core::bitwise_not(&templ_enhanced, &mut templ_inv, &Mat::default())?;
+        let mut edge_templ = Mat::default();
+        imgproc::canny(&scaled, &mut edge_templ, 50.0, 150.0, 3, false)?;
 
-        if templ_inv.cols() >= img_inv.cols() || templ_inv.rows() >= img_inv.rows() {
-            return Ok(StageOutcome::Retry(format!(
-                "clock template larger than band at scale {scale:.2}"
-            )));
+        if edge_templ.cols() >= edge_img.cols() || edge_templ.rows() >= edge_img.rows() {
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "clock template larger than band at scale {scale:.2}"
+                )),
+                ImageOutput::Passthrough,
+            ));
         }
 
-        // Template match — search only the left third of the band (clock is on the left)
-        let search_w = (img_inv.cols() as f64 * 0.35) as i32;
-        let left_roi = Rect::new(0, 0, search_w, img_inv.rows());
-        let left_region = Mat::roi(&img_inv, left_roi)?;
+        // Template match -- search only the left third of the band (clock is on the left)
+        let search_w = (edge_img.cols() as f64 * 0.35) as i32;
+        let left_roi = Rect::new(0, 0, search_w, edge_img.rows());
+        let left_region = Mat::roi(&edge_img, left_roi)?;
 
         let mut result = Mat::default();
         imgproc::match_template(
             &left_region,
-            &templ_inv,
+            &edge_templ,
             &mut result,
-            imgproc::TM_CCOEFF_NORMED,
+            imgproc::TM_CCORR_NORMED,
             &Mat::default(),
         )?;
 
@@ -163,9 +151,12 @@ impl Stage for FindClock {
         )?;
 
         if max_val < CLOCK_THRESHOLD {
-            return Ok(StageOutcome::Retry(format!(
-                "clock match too low: {max_val:.2} (need {CLOCK_THRESHOLD}), scale={scale:.2}"
-            )));
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "clock match too low: {max_val:.2} (need {CLOCK_THRESHOLD}), scale={scale:.2}"
+                )),
+                ImageOutput::Passthrough,
+            ));
         }
 
         // Clock center in band coordinates
@@ -174,79 +165,60 @@ impl Stage for FindClock {
         let clock_r = new_w.max(new_h) as f64 / 2.0;
 
         // The knob area starts to the right of the clock (with some margin)
-        let knob_x_start = clock_cx + clock_r * 1.5;
+        let knob_x_start = (clock_cx + clock_r * 1.5) as i32;
+        let band_w = src.cols();
+        let band_h = src.rows();
+
+        if knob_x_start >= band_w {
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "clock right edge {knob_x_start} exceeds band width {band_w}"
+                )),
+                ImageOutput::Passthrough,
+            ));
+        }
+
+        // Copy the region right of clock into dst
+        let right_roi = Rect::new(knob_x_start, 0, band_w - knob_x_start, band_h);
+        let right_region = Mat::roi(src, right_roi)?;
+        right_region.copy_to(dst)?;
 
         // Update knob_search with clock info (convert band-local Y to warped-image Y)
         let ks = state.knob_search.as_mut().unwrap();
-        ks.x_min = knob_x_start;
+        ks.x_min = knob_x_start as f64;
         ks.clock_center_x = clock_cx;
         ks.clock_center_y = clock_cy + ks.y_min; // convert to warped-image coords
         ks.clock_radius = clock_r;
 
-        Ok(StageOutcome::Success)
+        Ok((StageOutcome::Success, ImageOutput::Transformed))
     }
 
     fn max_retries(&self) -> u32 {
-        12 // 6 scales × 2
+        12 // 6 scales x 2
     }
 
     fn debug_image(
         &self,
         state: &PipelineState,
-        frame: &Mat,
+        working: &Mat,
+        _raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let (Some(crop), Some(persp), Some(search)) =
-            (&state.crop, &state.perspective, &state.knob_search)
-        else {
+        let Some(search) = &state.knob_search else {
             return Ok(None);
         };
 
-        // Warp and extract band
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let cropped = Mat::roi(frame, roi_rect)?;
-        let mat = transform_to_mat(&persp.matrix)?;
+        // working is the knob area (right of clock)
+        // For debug, we want to show the full band with annotations.
+        // Since we only have the knob area, we annotate what we have.
+        let mut canvas = working.try_clone()?;
 
-        let mut warped = Mat::default();
-        imgproc::warp_perspective_def(
-            &cropped,
-            &mut warped,
-            &mat,
-            Size::new(persp.output_width as i32, persp.output_height as i32),
-        )?;
-
-        let band_rect = Rect::new(
-            0,
-            search.y_min as i32,
-            persp.output_width as i32,
-            (search.y_max - search.y_min) as i32,
-        );
-        let mut canvas = Mat::roi(&warped, band_rect)?.try_clone()?;
-
-        // Draw clock circle in cyan
-        let cyan = Scalar::new(255.0, 255.0, 0.0, 0.0);
-        let clock_y_in_band = (search.clock_center_y - search.y_min) as i32;
-        imgproc::circle(
-            &mut canvas,
-            Point::new(search.clock_center_x as i32, clock_y_in_band),
-            search.clock_radius as i32,
-            cyan,
-            2,
-            imgproc::LINE_8,
-            0,
-        )?;
-
-        // Draw vertical line at x_min (knob area boundary) in yellow
+        // Draw a label indicating the x_offset
         let yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
         let canvas_h = canvas.rows();
         imgproc::line(
             &mut canvas,
-            Point::new(search.x_min as i32, 0),
-            Point::new(search.x_min as i32, canvas_h),
+            Point::new(0, 0),
+            Point::new(0, canvas_h),
             yellow,
             2,
             imgproc::LINE_8,
@@ -254,6 +226,6 @@ impl Stage for FindClock {
         )?;
 
         let jpeg = encode_jpeg(&canvas, 90)?;
-        Ok(Some(("S3c:FindClock".into(), jpeg)))
+        Ok(Some(("S7:FindClock".into(), jpeg)))
     }
 }

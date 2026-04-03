@@ -9,6 +9,7 @@ pub mod perspective;
 pub mod sanity;
 pub mod stage;
 pub mod util;
+pub mod warp_check;
 
 use opencv::core::{Mat, Rect, Size};
 use opencv::imgproc;
@@ -21,10 +22,21 @@ use stage::{PipelineState, StageDescriptor, StageOutcome};
 /// Per-stage debug image: (label, JPEG-encoded bytes).
 pub type DebugImage = (String, Vec<u8>);
 
+/// Whether a stage produced a new image in dst or passed through src unchanged.
+pub enum ImageOutput {
+    /// Stage wrote a transformed image into dst. Orchestrator swaps buffers.
+    Transformed,
+    /// Stage did not modify the image. Orchestrator keeps src as working image.
+    Passthrough,
+}
+
 /// Trait that concrete stage implementations must satisfy.
 ///
-/// Each stage receives the accumulated pipeline state and the current frame,
-/// mutates the state with its output, and returns a `StageOutcome`.
+/// Each stage receives the accumulated pipeline state and a double-buffer pair
+/// (src/dst), mutates the state with its output, and returns a `StageOutcome`
+/// plus an `ImageOutput` indicating whether it wrote into dst.
+///
+/// The `raw` parameter is the original full-resolution frame from the camera.
 /// The `iteration` parameter (0-based) tells the stage which parameter
 /// variation to try on retries.
 pub trait Stage {
@@ -34,18 +46,22 @@ pub trait Stage {
     ///
     /// * `state` — accumulated pipeline state; the stage reads its inputs from
     ///   prior stages and writes its own output.
-    /// * `frame` — the original BGR frame from the camera.
+    /// * `src` — the current working image from the previous stage.
+    /// * `dst` — the output buffer; write here if transforming the image.
+    /// * `raw` — the original BGR frame from the camera.
     /// * `iteration` — 0-based retry counter; stages can vary parameters based
     ///   on this value.
     ///
-    /// Returns `StageOutcome::Success` on success, `Retry` to try again with
-    /// the next iteration, or `Exhausted` when all retries are spent.
+    /// Returns `(StageOutcome, ImageOutput)` — outcome indicates success/retry/
+    /// exhausted, and image output indicates whether dst was written.
     fn run(
         &self,
         state: &mut PipelineState,
-        frame: &Mat,
+        src: &Mat,
+        dst: &mut Mat,
+        raw: &Mat,
         iteration: u32,
-    ) -> Result<StageOutcome, opencv::Error>;
+    ) -> Result<(StageOutcome, ImageOutput), opencv::Error>;
 
     /// Maximum retry iterations before this stage reports `Exhausted`.
     /// Default is 20; individual stages override as needed.
@@ -58,9 +74,10 @@ pub trait Stage {
     fn debug_image(
         &self,
         state: &PipelineState,
-        frame: &Mat,
+        working: &Mat,
+        raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let _ = (state, frame);
+        let _ = (state, working, raw);
         Ok(None)
     }
 }
@@ -207,15 +224,30 @@ impl Pipeline {
 
     /// Run the full calibration pipeline on a single frame.
     ///
-    /// Returns `Ok(())` when all 5 stages complete and the sanity check passes,
-    /// or `Err` if the pipeline cannot converge (Stage 1 exhausted, or an
-    /// OpenCV error).
+    /// Uses an image stack: each stage that returns `ImageOutput::Transformed`
+    /// pushes a new image onto the stack. The current working image is always
+    /// the top of the stack. Passthrough stages leave the stack unchanged.
+    ///
+    /// On fallback, the stack is truncated to the depth it had when the
+    /// fallback target stage originally ran, restoring the correct src image.
+    /// This is safe because only stages *after* the fallback target pushed
+    /// images, and those are the ones being discarded.
+    ///
+    /// Returns `Ok(())` when all stages complete and the sanity check passes,
+    /// or `Err` if the pipeline cannot converge.
     pub fn calibrate(&mut self, frame: &Mat) -> Result<(), PipelineError> {
         self.state = PipelineState::default();
         self.debug_images.clear();
 
+        // Image stack: Transformed stages push, fallback truncates.
+        // The raw frame is the implicit bottom of the stack.
+        let mut image_stack: Vec<Mat> = Vec::new();
+        let mut dst_buf = Mat::default(); // reusable scratch buffer for dst
+
         let mut stage_idx: usize = 0;
         let mut iterations: Vec<u32> = vec![0; self.stages.len()];
+        // Stack depth at entry to each stage — used to restore on fallback.
+        let mut entry_depth: Vec<usize> = vec![0; self.stages.len()];
         let mut total_iterations: u32 = 0;
         const MAX_TOTAL_ITERATIONS: u32 = 500;
 
@@ -230,23 +262,33 @@ impl Pipeline {
             let label = stage.descriptor().label;
             let iter = iterations[stage_idx];
 
+            // Record stack depth at entry for fallback recovery
+            entry_depth[stage_idx] = image_stack.len();
+
+            // Current working image: top of stack, or raw frame if stack is empty
+            let src = image_stack.last().unwrap_or(frame);
+
             debug!(stage = label, iter, "running stage");
 
-            match stage.run(&mut self.state, frame, iter)? {
+            let (outcome, img_out) = stage.run(&mut self.state, src, &mut dst_buf, frame, iter)?;
+
+            match outcome {
                 StageOutcome::Success => {
+                    // Push the new image if the stage transformed
+                    if matches!(img_out, ImageOutput::Transformed) {
+                        image_stack.push(std::mem::take(&mut dst_buf));
+                    }
+
                     info!(stage = label, iter, "stage succeeded");
 
-                    // Collect debug image if this stage is in the DEBUG_STAGES filter.
+                    // Collect debug image
                     if self.should_debug(stage_idx) {
-                        if let Some(img) = stage.debug_image(&self.state, frame)? {
+                        let working = image_stack.last().unwrap_or(frame);
+                        if let Some(img) = stage.debug_image(&self.state, working, frame)? {
                             self.debug_images.push(img);
                         }
                     }
 
-                    // Do NOT reset iterations[stage_idx] here — the counter
-                    // must persist across fallback cycles so that downstream
-                    // failures cause this stage to try different parameters
-                    // on each re-run.
                     stage_idx += 1;
                 }
 
@@ -255,15 +297,18 @@ impl Pipeline {
                     iterations[stage_idx] += 1;
 
                     if iterations[stage_idx] >= stage.max_retries() {
-                        // Exceeded max retries — treat as exhausted
                         warn!(
                             stage = label,
                             max = stage.max_retries(),
                             "stage exhausted retries"
                         );
-                        self.handle_fallback(
+                        let fallback_target = self.resolve_fallback(stage_idx)?;
+                        self.apply_fallback(
                             &mut stage_idx,
                             &mut iterations,
+                            &mut image_stack,
+                            &entry_depth,
+                            fallback_target,
                             &format!("{label} exhausted after {reason}"),
                         )?;
                     }
@@ -271,7 +316,15 @@ impl Pipeline {
 
                 StageOutcome::Exhausted(reason) => {
                     warn!(stage = label, %reason, "stage exhausted");
-                    self.handle_fallback(&mut stage_idx, &mut iterations, &reason)?;
+                    let fallback_target = self.resolve_fallback(stage_idx)?;
+                    self.apply_fallback(
+                        &mut stage_idx,
+                        &mut iterations,
+                        &mut image_stack,
+                        &entry_depth,
+                        fallback_target,
+                        &reason,
+                    )?;
                 }
             }
         }
@@ -284,45 +337,65 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Handle fallback: go back to the previous stage, incrementing its
-    /// iteration counter. If there is no previous stage, the pipeline fails.
-    fn handle_fallback(
+    /// Resolve the fallback target for a given stage. Returns the fallback
+    /// stage index or an error if there is no fallback.
+    fn resolve_fallback(&self, stage_idx: usize) -> Result<usize, PipelineError> {
+        let label = self.stages[stage_idx].descriptor().label;
+        match self.fallback_idx[stage_idx] {
+            Some(prev_idx) => Ok(prev_idx),
+            None => Err(PipelineError::Exhausted(format!(
+                "{label} exhausted with no fallback"
+            ))),
+        }
+    }
+
+    /// Apply fallback: truncate the image stack to the depth the fallback
+    /// target had at entry, reset the current stage's iteration counter, and
+    /// bump the fallback target's iteration. Cascades if the fallback target
+    /// is also exhausted.
+    fn apply_fallback(
         &self,
         stage_idx: &mut usize,
         iterations: &mut Vec<u32>,
+        image_stack: &mut Vec<Mat>,
+        entry_depth: &[usize],
+        fallback_target: usize,
         reason: &str,
     ) -> Result<(), PipelineError> {
         let label = self.stages[*stage_idx].descriptor().label;
+        let prev_label = self.stages[fallback_target].descriptor().label;
+        iterations[*stage_idx] = 0; // reset current stage
+        iterations[fallback_target] += 1; // bump fallback target
 
-        match self.fallback_idx[*stage_idx] {
-            Some(prev_idx) => {
-                let prev_label = self.stages[prev_idx].descriptor().label;
-                iterations[*stage_idx] = 0; // reset current stage
-                iterations[prev_idx] += 1; // bump previous stage
+        // Restore the image stack to the depth the fallback target originally saw
+        image_stack.truncate(entry_depth[fallback_target]);
 
-                if iterations[prev_idx] >= self.stages[prev_idx].max_retries() {
-                    // Previous stage also exhausted — try its fallback
-                    warn!(
-                        stage = prev_label,
-                        "fallback stage also exhausted, cascading"
-                    );
-                    *stage_idx = prev_idx;
-                    return self.handle_fallback(stage_idx, iterations, reason);
-                }
-
-                info!(
-                    stage = label,
-                    fallback = prev_label,
-                    iter = iterations[prev_idx],
-                    "falling back"
-                );
-                *stage_idx = prev_idx;
-                Ok(())
-            }
-            None => Err(PipelineError::Exhausted(format!(
-                "{label} exhausted with no fallback: {reason}"
-            ))),
+        if iterations[fallback_target] >= self.stages[fallback_target].max_retries() {
+            // Fallback target also exhausted — cascade
+            warn!(
+                stage = prev_label,
+                "fallback stage also exhausted, cascading"
+            );
+            *stage_idx = fallback_target;
+            let next_fallback = self.resolve_fallback(fallback_target)?;
+            return self.apply_fallback(
+                stage_idx,
+                iterations,
+                image_stack,
+                entry_depth,
+                next_fallback,
+                reason,
+            );
         }
+
+        info!(
+            stage = label,
+            fallback = prev_label,
+            iter = iterations[fallback_target],
+            "falling back"
+        );
+        *stage_idx = fallback_target;
+        Ok(())
     }
 
     fn save_cache(&self, frame: &Mat) -> Result<(), PipelineError> {
@@ -456,11 +529,13 @@ mod tests {
         fn run(
             &self,
             state: &mut PipelineState,
-            _frame: &Mat,
+            _src: &Mat,
+            _dst: &mut Mat,
+            _raw: &Mat,
             _iteration: u32,
-        ) -> Result<StageOutcome, opencv::Error> {
+        ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
             (self.populate)(state);
-            Ok(StageOutcome::Success)
+            Ok((StageOutcome::Success, ImageOutput::Passthrough))
         }
         fn max_retries(&self) -> u32 {
             self.retries
@@ -483,15 +558,20 @@ mod tests {
         fn run(
             &self,
             state: &mut PipelineState,
-            _frame: &Mat,
+            _src: &Mat,
+            _dst: &mut Mat,
+            _raw: &Mat,
             _iteration: u32,
-        ) -> Result<StageOutcome, opencv::Error> {
+        ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
             let n = self.attempts.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_count {
-                Ok(StageOutcome::Retry(format!("attempt {n}")))
+                Ok((
+                    StageOutcome::Retry(format!("attempt {n}")),
+                    ImageOutput::Passthrough,
+                ))
             } else {
                 (self.populate)(state);
-                Ok(StageOutcome::Success)
+                Ok((StageOutcome::Success, ImageOutput::Passthrough))
             }
         }
         fn max_retries(&self) -> u32 {
@@ -512,10 +592,15 @@ mod tests {
         fn run(
             &self,
             _state: &mut PipelineState,
-            _frame: &Mat,
+            _src: &Mat,
+            _dst: &mut Mat,
+            _raw: &Mat,
             _iteration: u32,
-        ) -> Result<StageOutcome, opencv::Error> {
-            Ok(StageOutcome::Retry("always fails".into()))
+        ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
+            Ok((
+                StageOutcome::Retry("always fails".into()),
+                ImageOutput::Passthrough,
+            ))
         }
         fn max_retries(&self) -> u32 {
             self.retries
@@ -567,7 +652,7 @@ mod tests {
             }),
             mock_success(
                 "FindVerticals",
-                "S2b:FindVerticals",
+                "S3:FindVerticals",
                 Some("FindLines"),
                 |s| {
                     s.verticals = Some(stage::VerticalPair {
@@ -588,7 +673,7 @@ mod tests {
             ),
             mock_success(
                 "Perspective",
-                "S3:Perspective",
+                "S4:Perspective",
                 Some("FindVerticals"),
                 |s| {
                     s.perspective = Some(stage::PerspectiveCorrection {
@@ -602,7 +687,8 @@ mod tests {
                     });
                 },
             ),
-            mock_success("ExtractBand", "S3b:ExtractBand", Some("Perspective"), |s| {
+            mock_success("WarpCheck", "S5:WarpCheck", Some("FindVerticals"), |_s| {}),
+            mock_success("ExtractBand", "S6:ExtractBand", Some("Perspective"), |s| {
                 s.knob_search = Some(stage::KnobSearchArea {
                     y_min: 10.0,
                     y_max: 190.0,
@@ -612,7 +698,7 @@ mod tests {
                     clock_radius: 0.0,
                 });
             }),
-            mock_success("FindClock", "S3c:FindClock", Some("ExtractBand"), |s| {
+            mock_success("FindClock", "S7:FindClock", Some("ExtractBand"), |s| {
                 if let Some(ks) = s.knob_search.as_mut() {
                     ks.x_min = 80.0;
                     ks.clock_center_x = 50.0;
@@ -620,7 +706,7 @@ mod tests {
                     ks.clock_radius = 25.0;
                 }
             }),
-            mock_success("FindFeatures", "S4:FindFeatures", Some("FindClock"), |s| {
+            mock_success("FindFeatures", "S8:FindFeatures", Some("FindClock"), |s| {
                 s.features = Some(stage::DetectedFeatures {
                     clock: stage::CircleFeature {
                         center_x: 50.0,
@@ -639,7 +725,7 @@ mod tests {
             }),
             mock_success(
                 "SanityCheck",
-                "S5:SanityCheck",
+                "S9:SanityCheck",
                 Some("FindVerticals"),
                 |s| {
                     s.validated = true;
@@ -693,7 +779,7 @@ mod tests {
             Box::new(FailNThenSucceed {
                 desc: StageDescriptor {
                     name: "Perspective",
-                    label: "S3:Perspective",
+                    label: "S4:Perspective",
                     fallback: Some("FindVerticals"),
                 },
                 fail_count: 2,
@@ -720,8 +806,8 @@ mod tests {
     }
 
     #[test]
-    fn fallback_stage3_exhausted_retries_stage2() {
-        // Stage 3 (Perspective) fails 3 times then succeeds
+    fn fallback_stage4_exhausted_retries_stage3() {
+        // Stage 4 (Perspective) fails 3 times then succeeds
         // Falls back to FindVerticals which re-runs, then Perspective succeeds
         let mut stages = all_success_stages();
         replace_stage(
@@ -730,7 +816,7 @@ mod tests {
             Box::new(FailNThenSucceed {
                 desc: StageDescriptor {
                     name: "Perspective",
-                    label: "S3:Perspective",
+                    label: "S4:Perspective",
                     fallback: Some("FindVerticals"),
                 },
                 fail_count: 3,

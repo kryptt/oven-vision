@@ -1,23 +1,23 @@
 use std::f64::consts::PI;
 
-use opencv::core::{Mat, Rect, Scalar, Size, Vec2f, Vector};
+use opencv::core::{Mat, Point, Scalar, Size, Vec2f, Vector};
 use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{Line, LinePair, PipelineState, StageDescriptor, StageOutcome};
 use super::util::{cluster_average, cluster_by_rho, draw_line};
-use super::{DebugImage, Stage};
+use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
 /// Maximum angular deviation from horizontal (in degrees) for a line to be
-/// considered "near-horizontal". In HoughLines, theta=π/2 is horizontal.
+/// considered "near-horizontal". In HoughLines, theta=pi/2 is horizontal.
 const HORIZONTAL_TOLERANCE_DEG: f64 = 15.0;
 
 /// Minimum vertical separation (in pixels of rho) between the two reference
 /// lines. Prevents picking two lines from the same chrome strip.
 const MIN_LINE_SEPARATION: f64 = 15.0;
 
-/// Rho clustering distance — lines with rho within this range are merged.
+/// Rho clustering distance -- lines with rho within this range are merged.
 const CLUSTER_RHO_THRESHOLD: f64 = 10.0;
 
 /// Stage 2: Detect horizontal reference lines and select a pair using
@@ -26,11 +26,11 @@ const CLUSTER_RHO_THRESHOLD: f64 = 10.0;
 /// fallback mechanism.
 ///
 /// Pair ranking heuristics (weighted sum):
-///   1. **Span** — wider vertical separation is better.
-///   2. **Position** — pair in the upper portion of the crop is better
+///   1. **Span** -- wider vertical separation is better.
+///   2. **Position** -- pair in the upper portion of the crop is better
 ///      (chrome trim is in the upper half, not the oven door area).
-///   3. **Parallelism** — similar slope is better.
-///   4. **Strength** — more Hough votes is better.
+///   3. **Parallelism** -- similar slope is better.
+///   4. **Strength** -- more Hough votes is better.
 pub struct FindLines;
 
 impl FindLines {
@@ -62,49 +62,56 @@ impl Stage for FindLines {
     fn run(
         &self,
         state: &mut PipelineState,
-        frame: &Mat,
+        src: &Mat,
+        _dst: &mut Mat,
+        _raw: &Mat,
         iteration: u32,
-    ) -> Result<StageOutcome, opencv::Error> {
+    ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
         let Some(crop) = &state.crop else {
-            return Ok(StageOutcome::Exhausted(
-                "no crop region from Stage 1".into(),
+            return Ok((
+                StageOutcome::Exhausted("no crop region from Stage 1".into()),
+                ImageOutput::Passthrough,
             ));
         };
 
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let cropped = Mat::roi(frame, roi_rect)?;
-
+        // src is already the cropped image from FindStove
         let mut gray = Mat::default();
-        imgproc::cvt_color_def(&cropped, &mut gray, imgproc::COLOR_BGR2GRAY)?;
+        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
 
-        // Blur before edge detection to reduce noise from chrome reflections.
-        // This helps find clean horizontal lines rather than fragmented edges.
-        let mut blurred = Mat::default();
-        imgproc::gaussian_blur(
-            &gray,
-            &mut blurred,
-            Size::new(5, 5),
-            1.5,
-            1.5,
-            opencv::core::BORDER_DEFAULT,
-        )?;
-
+        // CLAHE before blur for better contrast enhancement
         let mut enhanced = Mat::default();
-        let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
-        clahe.apply(&blurred, &mut enhanced)?;
+        let mut clahe = imgproc::create_clahe(3.0, Size::new(8, 8))?;
+        clahe.apply(&gray, &mut enhanced)?;
+
+        // Median blur after CLAHE to reduce salt-and-pepper noise from chrome reflections
+        let mut blurred = Mat::default();
+        imgproc::median_blur(&enhanced, &mut blurred, 5)?;
 
         let (canny_low, canny_high, hough_threshold) = Self::thresholds_for_iteration(iteration);
 
         let mut edges = Mat::default();
-        imgproc::canny(&enhanced, &mut edges, canny_low, canny_high, 3, false)?;
+        imgproc::canny(&blurred, &mut edges, canny_low, canny_high, 3, false)?;
+
+        // Morphological close with horizontal kernel to bridge fragmented horizontal edges
+        let kernel_h = imgproc::get_structuring_element(
+            imgproc::MORPH_RECT,
+            Size::new(3, 1),
+            Point::new(-1, -1),
+        )?;
+        let mut closed = Mat::default();
+        imgproc::morphology_ex(
+            &edges,
+            &mut closed,
+            imgproc::MORPH_CLOSE,
+            &kernel_h,
+            Point::new(-1, -1),
+            1,
+            opencv::core::BORDER_CONSTANT,
+            Scalar::default(),
+        )?;
 
         let mut lines_raw = Vector::<Vec2f>::new();
-        imgproc::hough_lines_def(&edges, &mut lines_raw, 1.0, PI / 180.0, hough_threshold)?;
+        imgproc::hough_lines_def(&closed, &mut lines_raw, 1.0, PI / 180.0, hough_threshold)?;
 
         // Filter for near-horizontal lines
         let horizontal_center = PI / 2.0;
@@ -120,20 +127,26 @@ impl Stage for FindLines {
         }
 
         if horizontal.len() < 2 {
-            return Ok(StageOutcome::Retry(format!(
-                "found {} horizontal lines (need 2), canny={canny_low}/{canny_high}, hough={hough_threshold}",
-                horizontal.len()
-            )));
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "found {} horizontal lines (need 2), canny={canny_low}/{canny_high}, hough={hough_threshold}",
+                    horizontal.len()
+                )),
+                ImageOutput::Passthrough,
+            ));
         }
 
         // Cluster lines by rho
         let clusters = cluster_by_rho(&horizontal, CLUSTER_RHO_THRESHOLD);
 
         if clusters.len() < 2 {
-            return Ok(StageOutcome::Retry(format!(
-                "only {} line cluster(s) after merging (need 2)",
-                clusters.len()
-            )));
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "only {} line cluster(s) after merging (need 2)",
+                    clusters.len()
+                )),
+                ImageOutput::Passthrough,
+            ));
         }
 
         // Summarise each cluster: (avg_rho, avg_theta, vote_count)
@@ -179,10 +192,13 @@ impl Stage for FindLines {
         }
 
         if candidates.is_empty() {
-            return Ok(StageOutcome::Retry(format!(
-                "{} clusters but no pair with separation >= {MIN_LINE_SEPARATION}",
-                summaries.len()
-            )));
+            return Ok((
+                StageOutcome::Retry(format!(
+                    "{} clusters but no pair with separation >= {MIN_LINE_SEPARATION}",
+                    summaries.len()
+                )),
+                ImageOutput::Passthrough,
+            ));
         }
 
         // Sort by score descending (best first)
@@ -209,7 +225,7 @@ impl Stage for FindLines {
             bottom: bot_line,
         });
 
-        Ok(StageOutcome::Success)
+        Ok((StageOutcome::Success, ImageOutput::Passthrough))
     }
 
     fn max_retries(&self) -> u32 {
@@ -219,19 +235,14 @@ impl Stage for FindLines {
     fn debug_image(
         &self,
         state: &PipelineState,
-        frame: &Mat,
+        working: &Mat,
+        _raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let (Some(crop), Some(lines)) = (&state.crop, &state.lines) else {
+        let (Some(_crop), Some(lines)) = (&state.crop, &state.lines) else {
             return Ok(None);
         };
 
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let mut canvas = Mat::roi(frame, roi_rect)?.try_clone()?;
+        let mut canvas = working.try_clone()?;
 
         // Draw top line in green
         draw_line(&mut canvas, &lines.top, Scalar::new(0.0, 255.0, 0.0, 0.0))?;
@@ -259,10 +270,10 @@ struct CandidatePair {
 /// Score a horizontal pair. Higher is better.
 ///
 /// Components (each normalised to 0..1, then weighted):
-///   - span:        separation / crop_height          (wider vertical gap = better)
-///   - position:    1 - avg_rho / crop_height          (upper half = better — chrome trim)
-///   - parallelism: 1 - |Δtheta| / max_Δtheta         (parallel = better)
+///   - position:    1 - avg_rho / crop_height          (upper half = better -- chrome trim)
 ///   - strength:    avg_votes / max_votes              (stronger = better)
+///   - parallelism: 1 - |delta_theta| / max_delta      (parallel = better)
+///   - span:        separation / crop_height            (wider vertical gap = better)
 fn score_pair(top: (f64, f64, usize), bot: (f64, f64, usize), crop_h: f64, max_votes: f64) -> f64 {
     let span = bot.0 - top.0;
     let span_norm = (span / crop_h).min(1.0);
@@ -278,9 +289,8 @@ fn score_pair(top: (f64, f64, usize), bot: (f64, f64, usize), crop_h: f64, max_v
     let avg_votes = (top.2 + bot.2) as f64 / 2.0;
     let strength_norm = (avg_votes / max_votes).min(1.0);
 
-    // Weights: strength matters most (strong chrome edges), then position,
-    // then parallelism, then span
-    0.30 * strength_norm + 0.30 * position_norm + 0.20 * parallel_norm + 0.20 * span_norm
+    // Weights: position matters most, then parallelism, then strength, then span
+    0.40 * position_norm + 0.25 * parallel_norm + 0.20 * strength_norm + 0.15 * span_norm
 }
 
 /// Convert a Hough (rho, theta) line to endpoint form spanning the full width.

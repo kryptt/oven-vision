@@ -22,6 +22,7 @@ use oven_vision::pipeline::find_verticals::FindVerticals;
 use oven_vision::pipeline::perspective::Perspective;
 use oven_vision::pipeline::sanity::{SanityCheck, quick_sanity_check};
 use oven_vision::pipeline::stage::CropRegion;
+use oven_vision::pipeline::warp_check::WarpCheck;
 use oven_vision::pipeline::{self, Pipeline, PipelineError};
 use oven_vision::preprocess::preprocess;
 
@@ -379,6 +380,7 @@ fn build_pipeline(cfg: &Config) -> Pipeline {
         Box::new(FindLines::new()),
         Box::new(FindVerticals::new()),
         Box::new(Perspective::new()),
+        Box::new(WarpCheck::new()),
         Box::new(ExtractBand::new()),
         Box::new(FindClock::new()),
         Box::new(FindFeatures::new()),
@@ -422,9 +424,14 @@ fn save_calibration_debug_images(pipe: &Pipeline, capture_dir: &Path) {
         return;
     }
 
-    for (label, jpeg) in images {
-        // label is like "S1:FindStove" → filename "calibration_S1_FindStove.jpg"
-        let filename = format!("calibration_{}.jpg", label.replace(':', "_"));
+    for (idx, (label, jpeg)) in images.iter().enumerate() {
+        // Prefix with sequence number so no overwrites across iterations.
+        // e.g., "calibration_003_S3_FindVerticals_L92_R735.jpg"
+        let filename = format!(
+            "calibration_{:03}_{}.jpg",
+            idx,
+            label.replace(':', "_")
+        );
         let path = capture_dir.join(&filename);
         match std::fs::write(&path, jpeg) {
             Ok(()) => info!(path = %path.display(), label, "saved calibration debug image"),

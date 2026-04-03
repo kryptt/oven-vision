@@ -1,11 +1,11 @@
-use opencv::core::{Mat, Point, Point2f, Rect, Scalar, Size};
+use opencv::core::{Mat, Point, Point2f, Scalar, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{
     Line, PerspectiveCorrection, PipelineState, StageDescriptor, StageOutcome, TransformMatrix,
 };
-use super::{DebugImage, Stage};
+use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
 /// Padding above the top line, as a fraction of the inter-line distance.
@@ -23,9 +23,9 @@ const JITTER_PX: f64 = 1.5;
 /// past the reference lines and produce garbage transforms.
 const MAX_JITTER_PX: f64 = 22.5;
 
-/// Stage 3: Compute and apply a perspective transform from the 4 corner
+/// Stage 4: Compute and apply a perspective transform from the 4 corner
 /// points formed by the intersection of horizontal lines (S2) and vertical
-/// lines (S2b).
+/// lines (S3).
 ///
 /// The 4 corners define the full trapezoid of the stove panel as seen by the
 /// camera. Mapping them to a rectangle corrects both vertical tilt AND
@@ -40,7 +40,7 @@ impl Perspective {
 
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     name: "Perspective",
-    label: "S3:Perspective",
+    label: "S4:Perspective",
     fallback: Some("FindVerticals"),
 };
 
@@ -52,13 +52,18 @@ impl Stage for Perspective {
     fn run(
         &self,
         state: &mut PipelineState,
-        frame: &Mat,
+        src: &Mat,
+        dst: &mut Mat,
+        _raw: &Mat,
         iteration: u32,
-    ) -> Result<StageOutcome, opencv::Error> {
+    ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
         let (Some(crop), Some(lines), Some(verts)) = (&state.crop, &state.lines, &state.verticals)
         else {
-            return Ok(StageOutcome::Exhausted(
-                "missing crop, lines, or verticals from previous stages".into(),
+            return Ok((
+                StageOutcome::Exhausted(
+                    "missing crop, lines, or verticals from previous stages".into(),
+                ),
+                ImageOutput::Passthrough,
             ));
         };
 
@@ -79,8 +84,11 @@ impl Stage for Perspective {
         let br = line_intersection(&lines.bottom, &verts.right);
 
         let (Some(tl), Some(tr), Some(bl), Some(br)) = (tl, tr, bl, br) else {
-            return Ok(StageOutcome::Retry(
-                "horizontal and vertical lines are parallel — no intersection".into(),
+            return Ok((
+                StageOutcome::Retry(
+                    "horizontal and vertical lines are parallel -- no intersection".into(),
+                ),
+                ImageOutput::Passthrough,
             ));
         };
 
@@ -91,9 +99,7 @@ impl Stage for Perspective {
             Point2f::new(bl.0 as f32, (bl.1 - jitter) as f32),
         ];
 
-        // Output uses full crop width — the verticals define the perspective
-        // correction but NOT the output extent. This way even if the verticals
-        // detect an internal edge (oven door divider), the full panel is preserved.
+        // Output uses full crop width
         let out_w = crop.width as i32;
 
         // Inter-line distance (average of left and right side distances)
@@ -106,38 +112,30 @@ impl Stage for Perspective {
         let out_h = (top_pad + inter_line + bot_pad) as i32;
 
         if out_w <= 0 || out_h <= 0 {
-            return Ok(StageOutcome::Retry(format!(
-                "invalid output dimensions: {out_w}x{out_h}"
-            )));
+            return Ok((
+                StageOutcome::Retry(format!("invalid output dimensions: {out_w}x{out_h}")),
+                ImageOutput::Passthrough,
+            ));
         }
 
-        // Destination: the panel corners map to a rectangle at their x positions
-        // within the full-width output. The warp extrapolates to fill the rest.
-        let left_x = ((tl.0 + bl.0) / 2.0) as f32;
-        let right_x = ((tr.0 + br.0) / 2.0) as f32;
+        // Destination: map the panel corners to a full rectangle
         let dst_pts: [Point2f; 4] = [
-            Point2f::new(left_x, top_pad as f32),                 // TL
-            Point2f::new(right_x, top_pad as f32),                // TR
-            Point2f::new(right_x, (top_pad + inter_line) as f32), // BR
-            Point2f::new(left_x, (top_pad + inter_line) as f32),  // BL
+            Point2f::new(0.0, top_pad as f32),                         // TL
+            Point2f::new(out_w as f32, top_pad as f32),                // TR
+            Point2f::new(out_w as f32, (top_pad + inter_line) as f32), // BR
+            Point2f::new(0.0, (top_pad + inter_line) as f32),          // BL
         ];
 
         let mat = imgproc::get_perspective_transform_slice_def(&src_pts, &dst_pts)?;
 
-        // Extract the cropped region and warp it
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let cropped = Mat::roi(frame, roi_rect)?;
+        // src is the cropped image; warp it into dst
+        imgproc::warp_perspective_def(src, dst, &mat, Size::new(out_w, out_h))?;
 
-        let mut warped = Mat::default();
-        imgproc::warp_perspective_def(&cropped, &mut warped, &mat, Size::new(out_w, out_h))?;
-
-        if warped.empty() {
-            return Ok(StageOutcome::Retry("warp produced empty image".into()));
+        if dst.empty() {
+            return Ok((
+                StageOutcome::Retry("warp produced empty image".into()),
+                ImageOutput::Passthrough,
+            ));
         }
 
         let matrix = mat_to_transform(&mat)?;
@@ -148,7 +146,7 @@ impl Stage for Perspective {
             output_height: out_h as u32,
         });
 
-        Ok(StageOutcome::Success)
+        Ok((StageOutcome::Success, ImageOutput::Transformed))
     }
 
     fn max_retries(&self) -> u32 {
@@ -158,9 +156,10 @@ impl Stage for Perspective {
     fn debug_image(
         &self,
         state: &PipelineState,
-        frame: &Mat,
+        working: &Mat,
+        _raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let (Some(crop), Some(lines), Some(verts), Some(persp)) = (
+        let (Some(_crop), Some(lines), Some(verts), Some(persp)) = (
             &state.crop,
             &state.lines,
             &state.verticals,
@@ -169,22 +168,8 @@ impl Stage for Perspective {
             return Ok(None);
         };
 
-        let roi_rect = Rect::new(
-            crop.x as i32,
-            crop.y as i32,
-            crop.width as i32,
-            crop.height as i32,
-        );
-        let cropped = Mat::roi(frame, roi_rect)?;
-        let mat = transform_to_mat(&persp.matrix)?;
-
-        let mut warped = Mat::default();
-        imgproc::warp_perspective_def(
-            &cropped,
-            &mut warped,
-            &mat,
-            Size::new(persp.output_width as i32, persp.output_height as i32),
-        )?;
+        // working is already the warped image
+        let mut canvas = working.try_clone()?;
 
         // Draw horizontal guide lines where the trim should now be level
         let w = persp.output_width as f64;
@@ -211,7 +196,7 @@ impl Stage for Perspective {
 
         let green = Scalar::new(0.0, 255.0, 0.0, 0.0);
         imgproc::line(
-            &mut warped,
+            &mut canvas,
             Point::new(0, y_top),
             Point::new(w as i32, y_top),
             green,
@@ -220,7 +205,7 @@ impl Stage for Perspective {
             0,
         )?;
         imgproc::line(
-            &mut warped,
+            &mut canvas,
             Point::new(0, y_bot),
             Point::new(w as i32, y_bot),
             green,
@@ -229,9 +214,9 @@ impl Stage for Perspective {
             0,
         )?;
 
-        let jpeg = encode_jpeg(&warped, 80)?;
+        let jpeg = encode_jpeg(&canvas, 80)?;
         let label = format!(
-            "S3:Perspective_{}x{}",
+            "S4:Perspective_{}x{}",
             persp.output_width, persp.output_height
         );
         Ok(Some((label, jpeg)))
