@@ -141,9 +141,6 @@ pub struct Pipeline {
     /// Comma-separated stage filters from DEBUG_STAGES env var.
     /// Empty = all stages. "none" = no stages.
     debug_filter: Vec<String>,
-    /// Optional callback fired each time a debug image is produced.
-    /// Arguments: (sequence index, label, jpeg bytes).
-    on_debug_image: Option<Box<dyn Fn(usize, &str, &[u8])>>,
 }
 
 impl Pipeline {
@@ -197,14 +194,7 @@ impl Pipeline {
             debug_images: Vec::new(),
             config,
             debug_filter,
-            on_debug_image: None,
         }
-    }
-
-    /// Set a callback that fires each time a debug image is produced during
-    /// calibration. The callback receives (sequence_index, label, jpeg_bytes).
-    pub fn set_debug_image_callback<F: Fn(usize, &str, &[u8]) + 'static>(&mut self, cb: F) {
-        self.on_debug_image = Some(Box::new(cb));
     }
 
     /// Try to load a cached pipeline state. Returns `true` if the cache was
@@ -340,9 +330,6 @@ impl Pipeline {
                         let working = image_stack.last().unwrap_or(frame);
                         if let Some(img) = stage.debug_image(&self.state, working, frame)? {
                             let idx = self.debug_images.len();
-                            if let Some(cb) = &self.on_debug_image {
-                                cb(idx, &img.0, &img.1);
-                            }
                             self.debug_images.push(img);
                             Some(idx)
                         } else {
@@ -859,7 +846,7 @@ mod tests {
     fn test_config() -> PipelineConfig {
         let tmp = tempfile::tempdir().unwrap();
         PipelineConfig {
-            cache_path: tmp.into_path().join("pipeline_cache.json"),
+            cache_path: tmp.keep().join("pipeline_cache.json"),
             max_frame_attempts: 3,
         }
     }

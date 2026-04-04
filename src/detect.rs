@@ -43,9 +43,6 @@ pub struct DialDetector {
     transition_count: Vec<u32>,
     /// The candidate state being accumulated
     candidate: Vec<DialState>,
-    /// Latest raw angle and confidence (for reporting)
-    latest_angle: Vec<Option<f64>>,
-    latest_confidence: Vec<f64>,
     /// Pre-computed rotated templates (computed once at construction).
     rotated_templates: Vec<RotatedTemplate>,
 }
@@ -85,15 +82,13 @@ const DEFAULT_LABELS: [&str; 10] = [
 ];
 
 impl DialDetector {
-    pub fn new(configs: Vec<DialConfig>) -> Self {
+    fn new(configs: Vec<DialConfig>) -> Self {
         let n = configs.len();
         Self {
             configs,
             confirmed: vec![DialState::Off; n],
             transition_count: vec![0; n],
             candidate: vec![DialState::Off; n],
-            latest_angle: vec![None; n],
-            latest_confidence: vec![0.0; n],
             rotated_templates: Vec::new(),
         }
     }
@@ -179,16 +174,13 @@ impl DialDetector {
                 &self.configs[i],
             )?;
 
-            self.latest_angle[i] = raw.angle_deg;
-            self.latest_confidence[i] = raw.confidence;
-
             self.apply_hysteresis(i, raw.state);
 
             results.push(DialReading {
                 label: self.configs[i].label.clone(),
                 state: self.confirmed[i],
-                angle_deg: self.latest_angle[i],
-                confidence: self.latest_confidence[i],
+                angle_deg: raw.angle_deg,
+                confidence: raw.confidence,
             });
         }
 

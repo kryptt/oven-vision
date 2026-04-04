@@ -1,5 +1,4 @@
 use opencv::core::{Mat, CV_8UC3};
-use opencv::prelude::*;
 
 use oven_vision::config::LedConfig;
 use oven_vision::led::{detect_leds, rgb_to_hsv};

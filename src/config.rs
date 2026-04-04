@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{fmt, io};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub go2rtc_url: String,
     pub mqtt: MqttConfig,
@@ -18,7 +18,7 @@ pub struct Config {
     pub pipeline: PipelineConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PipelineConfig {
     /// Initial crop region hint (x, y, width, height). If omitted, uses a
     /// built-in default covering the known stove panel area.
@@ -57,7 +57,7 @@ fn default_cache_path() -> String {
     "/data/captures/pipeline_cache.json".to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MqttConfig {
     pub host: String,
     #[serde(default = "default_mqtt_port")]
@@ -126,7 +126,7 @@ fn default_debug_port() -> u16 {
     8080
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CaptureConfig {
     #[serde(default = "default_capture_dir")]
     pub dir: String,

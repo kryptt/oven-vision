@@ -119,7 +119,7 @@ impl MqttPublisher {
     }
 
     /// Publish Home Assistant MQTT discovery configuration for all sensors.
-    pub async fn publish_discovery(
+    async fn publish_discovery(
         &self,
         dials: &[DialConfig],
         leds: &[LedConfig],
@@ -258,14 +258,6 @@ impl MqttPublisher {
         Ok(())
     }
 
-    /// Publish offline status and disconnect cleanly.
-    pub async fn shutdown(&self) -> Result<(), MqttError> {
-        self.client
-            .publish(AVAILABILITY_TOPIC, QoS::AtLeastOnce, true, "offline")
-            .await?;
-        self.client.disconnect().await?;
-        Ok(())
-    }
 }
 
 /// Convert a label to a URL/topic-safe slug (lowercase, spaces to underscores).

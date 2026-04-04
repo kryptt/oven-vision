@@ -1,6 +1,5 @@
 use opencv::core::{Mat, Vector};
 use opencv::imgcodecs;
-use opencv::prelude::*;
 use std::fmt;
 
 #[derive(Debug)]
