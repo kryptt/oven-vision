@@ -3,14 +3,12 @@ set -euo pipefail
 
 REGISTRY=registry.hr-home.xyz
 APP=oven-vision
-VERSION=2.1.3
+VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
 IMG=$REGISTRY/$APP:$VERSION
-LATEST=$REGISTRY/$APP:latest
 
 docker buildx build . -t "$IMG"
-docker tag "$IMG" "$LATEST"
 docker push "$IMG"
-docker push "$LATEST"
 
-echo "Pushed $IMG and $LATEST"
+echo "Pushed $IMG"
+echo "Update fleet manifest: image: $IMG"
