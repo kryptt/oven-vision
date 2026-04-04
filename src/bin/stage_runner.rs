@@ -162,35 +162,73 @@ fn cmd_run(
     let (stage, _idx) = find_stage(&stages, stage_name);
 
     let mut state = load_or_default_state(stage_name, state_path);
-    let mut dst = Mat::default();
     let raw = image.try_clone().expect("clone raw");
+    let max_retries = stage.max_retries();
 
     let start = Instant::now();
-    let (outcome, img_out) = stage
-        .run(&mut state, &image, &mut dst, &raw, 0)
-        .expect("stage run failed");
+    let mut first_success: Option<u32> = None;
+
+    // Run ALL iterations so every parameter variation is visible.
+    for iteration in 0..=max_retries {
+        // Reset state each iteration so earlier mutations don't accumulate.
+        let mut iter_state = load_or_default_state(stage_name, state_path);
+        let mut dst = Mat::default();
+        let (outcome, img_out) = stage
+            .run(&mut iter_state, &image, &mut dst, &raw, iteration)
+            .expect("stage run failed");
+
+        // Save output image for this iteration
+        let working = match img_out {
+            oven_vision::pipeline::ImageOutput::Transformed => &dst,
+            oven_vision::pipeline::ImageOutput::Passthrough => &image,
+        };
+        let img_path = output_dir.join(format!("{stage_name}_{iteration:03}_output.jpg"));
+        opencv::imgcodecs::imwrite_def(&img_path.to_string_lossy(), working)
+            .expect("failed to write output image");
+
+        // Save debug image for this iteration
+        if let Ok(Some((label, jpeg))) = stage.debug_image(&iter_state, working, &raw) {
+            let debug_path = output_dir.join(format!("{stage_name}_{iteration:03}_debug.jpg"));
+            std::fs::write(&debug_path, &jpeg).expect("failed to write debug image");
+            println!(
+                "  iter {iteration}: {} ({})",
+                format_outcome(&outcome),
+                label
+            );
+        } else {
+            println!("  iter {iteration}: {}", format_outcome(&outcome));
+        }
+
+        if first_success.is_none() {
+            if matches!(outcome, oven_vision::pipeline::stage::StageOutcome::Success) {
+                first_success = Some(iteration);
+                // Write the first-success state as the canonical state for chaining
+                state = iter_state;
+            }
+        }
+    }
     let elapsed = start.elapsed();
 
+    let total_iters = max_retries + 1;
     println!("stage: {}", stage.descriptor().label);
     println!("elapsed: {elapsed:?}");
-    println!("outcome: {}", format_outcome(&outcome));
+    match first_success {
+        Some(iter) => println!("first success: iter {iter} (of {total_iters} total)"),
+        None => println!("no successful iteration (ran {total_iters} total)"),
+    }
 
-    // Write output image
-    let working = match img_out {
-        oven_vision::pipeline::ImageOutput::Transformed => &dst,
-        oven_vision::pipeline::ImageOutput::Passthrough => &image,
-    };
-
+    // Write canonical output/debug from the first successful iteration (or iter 0 fallback)
+    let canon_iter = first_success.unwrap_or(0);
+    let canon_out = output_dir.join(format!("{stage_name}_{canon_iter:03}_output.jpg"));
     let img_path = output_dir.join(format!("{stage_name}_output.jpg"));
-    opencv::imgcodecs::imwrite_def(&img_path.to_string_lossy(), working)
-        .expect("failed to write output image");
+    std::fs::copy(&canon_out, &img_path).expect("failed to copy canonical output");
     println!("output image: {}", img_path.display());
 
-    // Write debug image if available
-    if let Ok(Some((label, jpeg))) = stage.debug_image(&state, working, &raw) {
+    let canon_dbg = output_dir.join(format!("{stage_name}_{canon_iter:03}_debug.jpg"));
+    if canon_dbg.exists() {
         let debug_path = output_dir.join(format!("{stage_name}_debug.jpg"));
-        std::fs::write(&debug_path, &jpeg).expect("failed to write debug image");
-        println!("debug image: {} ({})", debug_path.display(), label);
+        std::fs::copy(&canon_dbg, &debug_path).expect("failed to copy canonical debug");
+        println!("debug image: {}", debug_path.display());
     }
 
     // Write state JSON

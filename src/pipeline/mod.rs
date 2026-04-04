@@ -28,6 +28,7 @@ use stage::{PipelineState, StageDescriptor, StageOutcome};
 pub type DebugImage = (String, Vec<u8>);
 
 /// Whether a stage produced a new image in dst or passed through src unchanged.
+#[derive(Copy, Clone)]
 pub enum ImageOutput {
     /// Stage wrote a transformed image into dst. Orchestrator swaps buffers.
     Transformed,
