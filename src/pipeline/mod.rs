@@ -12,6 +12,7 @@ pub mod perspective;
 pub mod refine_warp;
 pub mod sanity;
 pub mod stage;
+pub mod testdata;
 pub mod util;
 pub mod warp_check;
 
@@ -495,6 +496,21 @@ impl Pipeline {
     /// Get debug images from the last calibration run.
     pub fn debug_images(&self) -> &[DebugImage] {
         &self.debug_images
+    }
+
+    /// Look up a stage by its `StageDescriptor::name` (e.g. `"FindStove"`).
+    /// Returns the stage reference and its index if found.
+    pub fn stage_by_name(&self, name: &str) -> Option<(usize, &dyn Stage)> {
+        self.stages
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.descriptor().name == name)
+            .map(|(i, s)| (i, s.as_ref()))
+    }
+
+    /// Return a slice over all stages in pipeline order.
+    pub fn stages(&self) -> &[Box<dyn Stage>] {
+        &self.stages
     }
 }
 

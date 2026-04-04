@@ -26,6 +26,13 @@ impl Templates {
         Self { knob, clock }
     }
 
+    /// Load templates from a custom directory (for use outside Docker).
+    pub fn load_from(dir: &std::path::Path) -> Self {
+        let knob = Self::load_and_enhance(&dir.join("knob.jpg").to_string_lossy());
+        let clock = Self::load_and_enhance(&dir.join("clock.jpg").to_string_lossy());
+        Self { knob, clock }
+    }
+
     fn load_and_enhance(path: &str) -> Mat {
         let raw = imgcodecs::imread(path, imgcodecs::IMREAD_GRAYSCALE).unwrap_or_else(|e| {
             tracing::warn!(%e, path, "failed to load template, using empty");

@@ -26,15 +26,24 @@ COPY tests/ tests/
 
 # --- Test stage: docker buildx build --target test . ---
 FROM builder AS test
+COPY benches/ benches/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     cargo test
 
-# --- Release build ---
-FROM builder AS release
+# --- Bench stage: verify benchmarks compile ---
+FROM builder AS bench
+COPY benches/ benches/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    cargo build --release --bin oven-vision
+    cargo bench --no-run
+
+# --- Release build ---
+FROM builder AS release
+COPY benches/ benches/
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    cargo build --release --bin oven-vision --bin oven-vision-stages
 
 # --- Runtime ---
 FROM alpine:3.21
@@ -42,6 +51,7 @@ FROM alpine:3.21
 RUN apk add --no-cache opencv libstdc++
 
 COPY --from=release /build/target/release/oven-vision /usr/local/bin/oven-vision
+COPY --from=release /build/target/release/oven-vision-stages /usr/local/bin/oven-vision-stages
 COPY templates/ /templates/
 
 EXPOSE 8080

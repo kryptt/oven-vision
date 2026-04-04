@@ -17,13 +17,24 @@ axum = "0.8"
 rayon = "1"
 tokio-stream = "0.1"
 async-stream = "0.3"
+clap = { version = "4", features = ["derive"] }
 
 [[bin]]
 name = "oven-vision"
 path = "src/main.rs"
 
+[[bin]]
+name = "oven-vision-stages"
+path = "src/bin/stage_runner.rs"
+
+[[bench]]
+name = "stages"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.14", features = ["flamegraph", "criterion"] }
 
 [profile.release]
 lto = true

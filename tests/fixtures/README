@@ -1,0 +1,11 @@
+Test fixtures for oven-vision pipeline stages.
+
+Place real oven images here for meaningful benchmarks and stage testing.
+
+Expected files:
+  oven.jpg     - Full 2560x1440 frame from go2rtc (used by criterion benches
+                 and the stage runner when --input is not specified).
+
+If no real images are present, the benchmark and runner tools generate
+synthetic grey frames. These are useful for profiling call overhead and
+verifying stages compile, but do not exercise real CV logic.
