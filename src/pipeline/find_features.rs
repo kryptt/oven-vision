@@ -265,7 +265,7 @@ impl Stage for FindFeatures {
         // Select top matches that are Y-aligned (best 10 by Y-consistency)
         let selected = select_y_aligned_knobs(&sorted_knobs, EXPECTED_KNOBS, knob_r);
 
-        let Some(knobs) = selected else {
+        let Some(mut knobs) = selected else {
             return Ok((
                 StageOutcome::Retry(format!(
                     "could not find {EXPECTED_KNOBS} Y-aligned knob matches, scale={scale:.2}"
@@ -273,6 +273,69 @@ impl Stage for FindFeatures {
                 ImageOutput::Passthrough,
             ));
         };
+
+        // --- Per-knob best-scale refinement ---
+        // Re-match each knob individually at all scales to find its true
+        // apparent size. Perspective makes closer knobs appear larger.
+        // Uses TM_CCOEFF_NORMED (mean-subtracted) which discriminates scale
+        // better than TM_CCORR_NORMED. Only tests the best rotation (±10°)
+        // to avoid 288 matches per knob.
+        let scene_w = scene_gray.cols();
+        let scene_h = scene_gray.rows();
+        for knob in &mut knobs {
+            let mut best_score = f64::NEG_INFINITY;
+            let mut best_radius = knob.radius;
+            let knob_angle = knob.angle;
+
+            // Only test templates near this knob's detected angle
+            let angle_tolerance = ROTATION_STEP_DEG * 1.5;
+
+            for pct in &self.knob_templates {
+                // Filter to nearby rotations
+                let angle_diff = (pct.angle - knob_angle).abs() % 360.0;
+                let angle_diff = angle_diff.min(360.0 - angle_diff);
+                if angle_diff > angle_tolerance {
+                    continue;
+                }
+
+                let tw = pct.gray.cols();
+                let th = pct.gray.rows();
+                // Local patch: just big enough to test this template
+                let margin = (tw.max(th) as f64 * 0.5) as i32;
+                let px0 = (knob.center_x as i32 - tw / 2 - margin).max(0);
+                let py0 = (knob.center_y as i32 - th / 2 - margin).max(0);
+                let px1 = (knob.center_x as i32 + tw / 2 + margin).min(scene_w);
+                let py1 = (knob.center_y as i32 + th / 2 + margin).min(scene_h);
+                let pw = px1 - px0;
+                let ph = py1 - py0;
+                if pw <= tw || ph <= th {
+                    continue;
+                }
+
+                let patch_roi = opencv::core::Rect::new(px0, py0, pw, ph);
+                let patch = Mat::roi(&scene_gray, patch_roi)?;
+
+                let mut result = Mat::default();
+                imgproc::match_template(
+                    &patch,
+                    &pct.gray,
+                    &mut result,
+                    imgproc::TM_CCOEFF_NORMED,
+                    &Mat::default(),
+                )?;
+
+                let mut max_val = 0.0f64;
+                opencv::core::min_max_loc(
+                    &result, None, Some(&mut max_val), None, None, &Mat::default(),
+                )?;
+
+                if max_val > best_score {
+                    best_score = max_val;
+                    best_radius = tw as f64 / 2.0;
+                }
+            }
+            knob.radius = best_radius;
+        }
 
         // Translate coordinates back to warped-image space
         let knob_median_y = {
@@ -327,7 +390,7 @@ impl Stage for FindFeatures {
                 .map(|k| CircleFeature {
                     center_x: k.center_x + x_offset,
                     center_y: k.center_y + y_offset,
-                    radius: knob_r,
+                    radius: k.radius,
                 })
                 .collect(),
             off_angles,
@@ -413,11 +476,12 @@ struct TemplateMatch {
     angle: f64,
 }
 
-/// Knob match with center and angle.
+/// Knob match with center, angle, and per-knob radius from best-scale matching.
 struct KnobMatch {
     center_x: f64,
     center_y: f64,
     angle: f64,
+    radius: f64,
 }
 
 /// Resize a grayscale template to a given scale factor.
@@ -590,6 +654,7 @@ fn select_y_aligned_knobs(
                     center_x: m.x,
                     center_y: m.y,
                     angle: m.angle,
+                    radius: knob_r,
                 })
                 .collect();
             best = Some((knobs, y_score));
