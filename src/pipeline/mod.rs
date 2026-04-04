@@ -86,6 +86,34 @@ pub trait Stage {
     }
 }
 
+/// Blanket impl so `Arc<T: Stage>` can be stored in `Box<dyn Stage>`.
+impl<T: Stage> Stage for std::sync::Arc<T> {
+    fn descriptor(&self) -> StageDescriptor {
+        (**self).descriptor()
+    }
+    fn run(
+        &self,
+        state: &mut PipelineState,
+        src: &Mat,
+        dst: &mut Mat,
+        raw: &Mat,
+        iteration: u32,
+    ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
+        (**self).run(state, src, dst, raw, iteration)
+    }
+    fn max_retries(&self) -> u32 {
+        (**self).max_retries()
+    }
+    fn debug_image(
+        &self,
+        state: &PipelineState,
+        working: &Mat,
+        raw: &Mat,
+    ) -> Result<Option<DebugImage>, opencv::Error> {
+        (**self).debug_image(state, working, raw)
+    }
+}
+
 /// Pipeline configuration.
 pub struct PipelineConfig {
     /// Path to the JSON cache file on disk.
@@ -113,6 +141,9 @@ pub struct Pipeline {
     /// Comma-separated stage filters from DEBUG_STAGES env var.
     /// Empty = all stages. "none" = no stages.
     debug_filter: Vec<String>,
+    /// Optional callback fired each time a debug image is produced.
+    /// Arguments: (sequence index, label, jpeg bytes).
+    on_debug_image: Option<Box<dyn Fn(usize, &str, &[u8])>>,
 }
 
 impl Pipeline {
@@ -166,7 +197,14 @@ impl Pipeline {
             debug_images: Vec::new(),
             config,
             debug_filter,
+            on_debug_image: None,
         }
+    }
+
+    /// Set a callback that fires each time a debug image is produced during
+    /// calibration. The callback receives (sequence_index, label, jpeg_bytes).
+    pub fn set_debug_image_callback<F: Fn(usize, &str, &[u8]) + 'static>(&mut self, cb: F) {
+        self.on_debug_image = Some(Box::new(cb));
     }
 
     /// Try to load a cached pipeline state. Returns `true` if the cache was
@@ -200,22 +238,44 @@ impl Pipeline {
     /// the previous frame's full retry budget is exhausted.
     pub fn calibrate_with_fetch<F>(&mut self, mut fetch_frame: F) -> Result<(), PipelineError>
     where
-        F: FnMut() -> Result<Mat, PipelineError>,
+        F: FnMut() -> Result<Mat, PipelineError> + Send + 'static,
     {
         let max_attempts = self.config.max_frame_attempts;
 
+        // Fetch the first frame synchronously.
+        let mut current_frame = fetch_frame()?;
+
         for attempt in 0..max_attempts {
-            let frame = fetch_frame()?;
             info!(
                 attempt,
                 max_attempts, "calibration attempt with fresh frame"
             );
 
-            match self.calibrate(&frame) {
+            // Prefetch the next frame on a background thread while we process
+            // the current one. If we succeed, the prefetched frame is discarded.
+            let prefetch = if attempt + 1 < max_attempts {
+                Some(std::thread::spawn(move || {
+                    let result = fetch_frame();
+                    (result, fetch_frame)
+                }))
+            } else {
+                None
+            };
+
+            match self.calibrate(&current_frame) {
                 Ok(()) => return Ok(()),
                 Err(PipelineError::Exhausted(reason)) => {
                     warn!(attempt, %reason, "frame exhausted, will try next");
-                    continue;
+                    match prefetch {
+                        Some(handle) => {
+                            let (result, returned_fetch) = handle.join().unwrap_or_else(|e| {
+                                std::panic::resume_unwind(e);
+                            });
+                            current_frame = result?;
+                            fetch_frame = returned_fetch;
+                        }
+                        None => break,
+                    }
                 }
                 Err(other) => return Err(other),
             }
@@ -252,16 +312,7 @@ impl Pipeline {
         let mut iterations: Vec<u32> = vec![0; self.stages.len()];
         // Stack depth at entry to each stage — used to restore on fallback.
         let mut entry_depth: Vec<usize> = vec![0; self.stages.len()];
-        let mut total_iterations: u32 = 0;
-        const MAX_TOTAL_ITERATIONS: u32 = 500;
-
         while stage_idx < self.stages.len() {
-            total_iterations += 1;
-            if total_iterations > MAX_TOTAL_ITERATIONS {
-                return Err(PipelineError::Exhausted(format!(
-                    "exceeded {MAX_TOTAL_ITERATIONS} total iterations"
-                )));
-            }
             let stage = &self.stages[stage_idx];
             let label = stage.descriptor().label;
             let iter = iterations[stage_idx];
@@ -284,12 +335,16 @@ impl Pipeline {
                         image_stack.push(std::mem::take(&mut dst_buf));
                     }
 
-                    // Collect debug image
+                    // Collect debug image and fire callback immediately
                     let img_seq = if self.should_debug(stage_idx) {
                         let working = image_stack.last().unwrap_or(frame);
                         if let Some(img) = stage.debug_image(&self.state, working, frame)? {
+                            let idx = self.debug_images.len();
+                            if let Some(cb) = &self.on_debug_image {
+                                cb(idx, &img.0, &img.1);
+                            }
                             self.debug_images.push(img);
-                            Some(self.debug_images.len() - 1)
+                            Some(idx)
                         } else {
                             None
                         }
@@ -659,6 +714,7 @@ mod tests {
                         x2: 800.0,
                         y2: 45.0,
                     },
+                    avg_theta: std::f64::consts::FRAC_PI_2,
                 });
             }),
             mock_success(

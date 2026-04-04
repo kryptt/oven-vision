@@ -151,6 +151,7 @@ mod tests {
                     x2: 800.0,
                     y2: 45.0,
                 },
+                avg_theta: std::f64::consts::FRAC_PI_2,
             }),
             verticals: Some(VerticalPair {
                 left: Line {

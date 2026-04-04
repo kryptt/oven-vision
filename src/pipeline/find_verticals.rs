@@ -1,6 +1,6 @@
 use std::f64::consts::PI;
 
-use opencv::core::{CV_16S, Mat, Point, Rect, Scalar, Size, Vec4i, Vector};
+use opencv::core::{CV_16S, Mat, Rect, Scalar, Vec4i, Vector};
 use opencv::imgproc;
 use opencv::prelude::*;
 
@@ -65,12 +65,12 @@ impl Stage for FindVerticals {
         _raw: &Mat,
         iteration: u32,
     ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
-        let Some(crop) = &state.crop else {
+        if state.crop.is_none() {
             return Ok((
                 StageOutcome::Exhausted("no crop region from Stage 1".into()),
                 ImageOutput::Passthrough,
             ));
-        };
+        }
 
         let w = src.cols();
         let h = src.rows();
@@ -81,22 +81,11 @@ impl Stage for FindVerticals {
             ));
         }
 
-        // Convert to grayscale
-        let mut gray = Mat::default();
-        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-
-        // Bilateral filter: preserves material boundaries while smoothing texture.
-        // Vary sigma on iteration for robustness.
-        let sigma = 75.0 + (iteration as f64 * 5.0).min(50.0);
-        let mut smooth = Mat::default();
-        imgproc::bilateral_filter(
-            &gray,
-            &mut smooth,
-            9,
-            sigma,
-            sigma,
-            opencv::core::BORDER_DEFAULT,
-        )?;
+        // CLAHE-enhanced grayscale: boosts contrast at material boundaries.
+        // Vary median blur kernel on iteration for robustness.
+        let blur_k = 5 + (iteration as i32 * 2).min(6); // 5, 7, 9, 11
+        let blur_k = blur_k | 1; // must be odd
+        let smooth = super::util::enhance_gray(src, blur_k)?;
 
         // Sobel in X direction only — finds vertical edges, ignores horizontal.
         // Signed 16-bit to preserve gradient polarity.
@@ -143,7 +132,7 @@ impl Stage for FindVerticals {
         let left_result = column_profile[..left_search_end]
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            .min_by(|(_, a), (_, b)| a.total_cmp(b));
 
         let Some((left_x, &left_val)) = left_result else {
             return Ok((
@@ -166,7 +155,7 @@ impl Stage for FindVerticals {
         let right_result = column_profile[right_search_start..]
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            .max_by(|(_, a), (_, b)| a.total_cmp(b));
 
         let Some((right_offset, &right_val)) = right_result else {
             return Ok((
@@ -196,9 +185,19 @@ impl Stage for FindVerticals {
             ));
         }
 
-        // Optional: refine slope with HoughLinesP on narrow strips around each boundary
-        let left_line = refine_boundary_slope(&sobel_x, left_x as i32, w, h, true)?;
-        let right_line = refine_boundary_slope(&sobel_x, right_x as i32, w, h, false)?;
+        // Expected perpendicular angle from S2's horizontal lines.
+        // In Hough space, horizontal theta ~ PI/2; perpendicular ~ 0 or PI.
+        // Convert to a slope angle (radians from vertical) for segment filtering.
+        let expected_perp = state
+            .lines
+            .as_ref()
+            .map(|lp| lp.avg_theta - PI / 2.0)
+            .unwrap_or(0.0);
+
+        // Refine slope with HoughLinesP, filtering by perpendicularity to horizontals
+        let left_line = refine_boundary_slope(&sobel_x, left_x as i32, w, h, true, expected_perp)?;
+        let right_line =
+            refine_boundary_slope(&sobel_x, right_x as i32, w, h, false, expected_perp)?;
 
         state.verticals = Some(VerticalPair {
             left: left_line,
@@ -247,6 +246,10 @@ impl Stage for FindVerticals {
 /// Refine the slope of a detected boundary using HoughLinesP on a narrow
 /// vertical strip around the detected X column.
 ///
+/// `expected_perp` is the expected angle (radians) of the vertical boundary
+/// relative to true vertical, derived from the horizontal lines in S2.
+/// Segments are scored by proximity to this angle.
+///
 /// If HoughLinesP finds a segment, returns its endpoints as a Line.
 /// Otherwise, returns a vertical line at the detected X.
 fn refine_boundary_slope(
@@ -255,6 +258,7 @@ fn refine_boundary_slope(
     img_w: i32,
     img_h: i32,
     is_negative: bool,
+    expected_perp: f64,
 ) -> Result<Line, opencv::Error> {
     let strip_half = 25;
     let x0 = (center_x - strip_half).max(0);
@@ -306,7 +310,13 @@ fn refine_boundary_slope(
                 Vec4i::from([l[2], l[3], l[0], l[1]]) // flip
             }
         })
-        .filter(|l| l[2] <= l[0]) // x2 <= x1 = negative slope (left-leaning)
+        .filter(|l| {
+            if is_negative {
+                l[2] <= l[0] // x2 <= x1 = negative slope (left-leaning)
+            } else {
+                l[2] >= l[0] // x2 >= x1 = positive slope (right-leaning)
+            }
+        })
         .collect();
 
     if negative_slope.is_empty() {
@@ -318,15 +328,33 @@ fn refine_boundary_slope(
         });
     }
 
-    // Pick the longest segment
-    let mut best_len = 0.0f64;
+    // Score segments by length and proximity to the expected perpendicular angle.
+    // Perpendicular tolerance: 20 degrees max deviation.
+    const PERP_TOLERANCE: f64 = 20.0 * PI / 180.0;
+    let max_len: f64 = negative_slope
+        .iter()
+        .map(|l| {
+            let dx = (l[2] - l[0]) as f64;
+            let dy = (l[3] - l[1]) as f64;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .fold(1.0f64, f64::max);
+
+    let mut best_score = f64::NEG_INFINITY;
     let mut best_line = negative_slope[0];
     for l in &negative_slope {
         let dx = (l[2] - l[0]) as f64;
         let dy = (l[3] - l[1]) as f64;
         let len = (dx * dx + dy * dy).sqrt();
-        if len > best_len {
-            best_len = len;
+        // Angle from vertical (atan2 gives angle from horizontal, subtract PI/2)
+        let seg_angle = dx.atan2(dy); // radians from vertical
+        let angle_dev = (seg_angle - expected_perp).abs();
+        let angle_score = 1.0 - (angle_dev / PERP_TOLERANCE).min(1.0);
+        let len_score = len / max_len;
+        // Weight: 60% angle proximity, 40% length
+        let score = 0.6 * angle_score + 0.4 * len_score;
+        if score > best_score {
+            best_score = score;
             best_line = *l;
         }
     }

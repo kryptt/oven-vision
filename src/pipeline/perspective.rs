@@ -8,8 +8,7 @@ use super::stage::{
 use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
-/// Padding above the top line, as a fraction of the inter-line distance.
-const TOP_PADDING_FRAC: f64 = 0.5;
+use super::util::TOP_PADDING_FRAC;
 
 /// Padding below the bottom line, as a fraction of the inter-line distance.
 /// The knobs sit 6-8x the band height below the bottom chrome trim.
@@ -129,7 +128,15 @@ impl Stage for Perspective {
         let mat = imgproc::get_perspective_transform_slice_def(&src_pts, &dst_pts)?;
 
         // src is the cropped image; warp it into dst
-        imgproc::warp_perspective_def(src, dst, &mat, Size::new(out_w, out_h))?;
+        imgproc::warp_perspective(
+            src,
+            dst,
+            &mat,
+            Size::new(out_w, out_h),
+            imgproc::INTER_CUBIC,
+            opencv::core::BORDER_CONSTANT,
+            Scalar::default(),
+        )?;
 
         if dst.empty() {
             return Ok((
@@ -150,7 +157,7 @@ impl Stage for Perspective {
     }
 
     fn max_retries(&self) -> u32 {
-        30
+        10
     }
 
     fn debug_image(

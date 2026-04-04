@@ -1,20 +1,19 @@
+use std::sync::Arc;
+
 use opencv::core::{Mat, Point, Rect, Scalar, Size};
-use opencv::imgcodecs;
 use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{PipelineState, StageDescriptor, StageOutcome};
+use super::util::{Templates, enhance_gray};
 use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
 /// Scale factors for clock template matching.
 const SCALE_FACTORS: [f64; 6] = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40];
 
-/// Match threshold for clock detection.
-const CLOCK_THRESHOLD: f64 = 0.25;
-
-/// Path to the clock template.
-const CLOCK_TEMPLATE_PATH: &str = "/templates/clock.jpg";
+/// Match threshold for grayscale TM_CCORR_NORMED clock detection.
+const CLOCK_THRESHOLD: f64 = 0.70;
 
 /// Stage 7: Find the analog clock in the extracted band.
 ///
@@ -23,17 +22,12 @@ const CLOCK_TEMPLATE_PATH: &str = "/templates/clock.jpg";
 /// finds the clock, and copies the region right of the clock into `dst`.
 /// It also stores the x_offset in state for coordinate translation.
 pub struct FindClock {
-    template: Mat,
+    templates: Arc<Templates>,
 }
 
 impl FindClock {
-    pub fn new() -> Self {
-        let template = imgcodecs::imread(CLOCK_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
-            .unwrap_or_else(|e| {
-                tracing::warn!(%e, "failed to load clock template");
-                Mat::default()
-            });
-        Self { template }
+    pub fn new(templates: Arc<Templates>) -> Self {
+        Self { templates }
     }
 }
 
@@ -56,14 +50,14 @@ impl Stage for FindClock {
         _raw: &Mat,
         iteration: u32,
     ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
-        let Some(search) = &state.knob_search else {
+        if state.knob_search.is_none() {
             return Ok((
                 StageOutcome::Exhausted("missing prior state".into()),
                 ImageOutput::Passthrough,
             ));
-        };
+        }
 
-        if self.template.empty() {
+        if self.templates.clock.empty() {
             return Ok((
                 StageOutcome::Exhausted("clock template not loaded".into()),
                 ImageOutput::Passthrough,
@@ -72,24 +66,16 @@ impl Stage for FindClock {
 
         // src is the band image from ExtractBand
 
-        // Convert to grayscale + enhance
-        let mut gray = Mat::default();
-        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-        let mut clahe_obj = imgproc::create_clahe(3.0, Size::new(8, 8))?;
-        let mut enhanced = Mat::default();
-        clahe_obj.apply(&gray, &mut enhanced)?;
-
-        // Median blur before edge detection
-        let mut blurred = Mat::default();
-        imgproc::median_blur(&enhanced, &mut blurred, 3)?;
+        // Grayscale + CLAHE + blur (no Canny — preserves texture for better matching)
+        let blurred = enhance_gray(src, 3)?;
 
         // Pick scale from iteration
         let scale_idx = (iteration as usize) % SCALE_FACTORS.len();
         let scale = SCALE_FACTORS[scale_idx];
 
-        // Scale the template
-        let new_w = (self.template.cols() as f64 * scale) as i32;
-        let new_h = (self.template.rows() as f64 * scale) as i32;
+        // Scale the template (already CLAHE-enhanced via shared Templates)
+        let new_w = (self.templates.clock.cols() as f64 * scale) as i32;
+        let new_h = (self.templates.clock.rows() as f64 * scale) as i32;
         if new_w < 5 || new_h < 5 {
             return Ok((
                 StageOutcome::Retry(format!("clock template too small at scale {scale:.2}")),
@@ -98,7 +84,7 @@ impl Stage for FindClock {
         }
         let mut scaled = Mat::default();
         imgproc::resize(
-            &self.template,
+            &self.templates.clock,
             &mut scaled,
             Size::new(new_w, new_h),
             0.0,
@@ -106,14 +92,7 @@ impl Stage for FindClock {
             imgproc::INTER_AREA,
         )?;
 
-        // Edge-based template matching: apply Canny to both image and template
-        let mut edge_img = Mat::default();
-        imgproc::canny(&blurred, &mut edge_img, 50.0, 150.0, 3, false)?;
-
-        let mut edge_templ = Mat::default();
-        imgproc::canny(&scaled, &mut edge_templ, 50.0, 150.0, 3, false)?;
-
-        if edge_templ.cols() >= edge_img.cols() || edge_templ.rows() >= edge_img.rows() {
+        if scaled.cols() >= blurred.cols() || scaled.rows() >= blurred.rows() {
             return Ok((
                 StageOutcome::Retry(format!(
                     "clock template larger than band at scale {scale:.2}"
@@ -122,15 +101,15 @@ impl Stage for FindClock {
             ));
         }
 
-        // Template match -- search only the left third of the band (clock is on the left)
-        let search_w = (edge_img.cols() as f64 * 0.35) as i32;
-        let left_roi = Rect::new(0, 0, search_w, edge_img.rows());
-        let left_region = Mat::roi(&edge_img, left_roi)?;
+        // Grayscale template matching — search only the left 35% of the band
+        let search_w = (blurred.cols() as f64 * 0.35) as i32;
+        let left_roi = Rect::new(0, 0, search_w, blurred.rows());
+        let left_region = Mat::roi(&blurred, left_roi)?;
 
         let mut result = Mat::default();
         imgproc::match_template(
             &left_region,
-            &edge_templ,
+            &scaled,
             &mut result,
             imgproc::TM_CCORR_NORMED,
             &Mat::default(),
@@ -203,9 +182,9 @@ impl Stage for FindClock {
         working: &Mat,
         _raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let Some(search) = &state.knob_search else {
+        if state.knob_search.is_none() {
             return Ok(None);
-        };
+        }
 
         // working is the knob area (right of clock)
         // For debug, we want to show the full band with annotations.

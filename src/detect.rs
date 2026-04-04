@@ -46,6 +46,8 @@ pub struct DialDetector {
     /// Latest raw angle and confidence (for reporting)
     latest_angle: Vec<Option<f64>>,
     latest_confidence: Vec<f64>,
+    /// Pre-computed rotated templates (computed once at construction).
+    rotated_templates: Vec<RotatedTemplate>,
 }
 
 /// Maximum distinguishable angular distance (degrees).
@@ -56,11 +58,17 @@ const MAX_ROTATION_DEG: f64 = 180.0;
 /// readings before flipping state.
 const HYSTERESIS_FRAMES: u32 = 3;
 
-/// Pre-computed rotation angles for template matching (0-340 in 20-degree steps).
+/// Rotation angles for template matching (0-340 in 20-degree steps).
 const TEMPLATE_ANGLES: [f64; 18] = [
     0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0, 220.0, 240.0, 260.0,
     280.0, 300.0, 320.0, 340.0,
 ];
+
+/// A pre-computed rotated template for runtime detection.
+struct RotatedTemplate {
+    mat: Mat,
+    angle: f64,
+}
 
 /// Default dial labels in left-to-right order (matching the stove layout).
 const DEFAULT_LABELS: [&str; 10] = [
@@ -86,6 +94,7 @@ impl DialDetector {
             candidate: vec![DialState::Off; n],
             latest_angle: vec![None; n],
             latest_confidence: vec![0.0; n],
+            rotated_templates: Vec::new(),
         }
     }
 
@@ -137,14 +146,37 @@ impl DialDetector {
         warped_gray: &Mat,
         knob_template: &Mat,
     ) -> Result<Vec<DialReading>, opencv::Error> {
+        // Pre-compute rotated templates once (lazy init)
+        if self.rotated_templates.is_empty() && !knob_template.empty() {
+            let templ_cx = knob_template.cols() as f64 / 2.0;
+            let templ_cy = knob_template.rows() as f64 / 2.0;
+            for &angle in &TEMPLATE_ANGLES {
+                let rot_mat = imgproc::get_rotation_matrix_2d(
+                    Point2f::new(templ_cx as f32, templ_cy as f32),
+                    -angle,
+                    1.0,
+                )?;
+                let mut rotated = Mat::default();
+                imgproc::warp_affine(
+                    knob_template,
+                    &mut rotated,
+                    &rot_mat,
+                    Size::new(knob_template.cols(), knob_template.rows()),
+                    imgproc::INTER_LINEAR,
+                    BORDER_CONSTANT,
+                    Scalar::default(),
+                )?;
+                self.rotated_templates.push(RotatedTemplate { mat: rotated, angle });
+            }
+        }
+
         let mut results = Vec::with_capacity(self.configs.len());
 
         for i in 0..self.configs.len() {
-            let raw = detect_single_template(
+            let raw = detect_single_precomputed(
                 warped_gray,
-                knob_template,
+                &self.rotated_templates,
                 &self.configs[i],
-                &TEMPLATE_ANGLES,
             )?;
 
             self.latest_angle[i] = raw.angle_deg;
@@ -190,24 +222,20 @@ fn state_category(state: DialState) -> u8 {
     }
 }
 
-/// Detect a single knob's state by template matching at multiple rotations.
+/// Detect a single knob using pre-computed rotated templates.
 ///
-/// Returns the best-matching rotation angle (0° = template as-is = OFF)
-/// and the match confidence. The off_angle from `cfg` is the calibration
-/// baseline (always 0° for template-based detection since the template
-/// IS the off position).
-fn detect_single_template(
+/// Eliminates per-frame warp_affine calls — just runs matchTemplate with
+/// the cached rotated mats.
+fn detect_single_precomputed(
     warped_gray: &Mat,
-    knob_template: &Mat,
+    templates: &[RotatedTemplate],
     cfg: &DialConfig,
-    angles: &[f64],
 ) -> Result<DialReading, opencv::Error> {
     let cx = cfg.center_x as i32;
     let cy = cfg.center_y as i32;
     let r = cfg.radius as i32;
     let margin = r * 2;
 
-    // Extract ROI around the knob (with margin for rotation)
     let img_w = warped_gray.cols();
     let img_h = warped_gray.rows();
     let x0 = (cx - margin).max(0);
@@ -215,7 +243,10 @@ fn detect_single_template(
     let x1 = (cx + margin).min(img_w);
     let y1 = (cy + margin).min(img_h);
 
-    if x1 - x0 < knob_template.cols() || y1 - y0 < knob_template.rows() {
+    let templ_w = templates.first().map(|t| t.mat.cols()).unwrap_or(0);
+    let templ_h = templates.first().map(|t| t.mat.rows()).unwrap_or(0);
+
+    if x1 - x0 < templ_w || y1 - y0 < templ_h {
         return Ok(DialReading {
             label: cfg.label.clone(),
             state: DialState::Unavailable,
@@ -229,46 +260,24 @@ fn detect_single_template(
     let mut best_angle = 0.0f64;
     let mut best_score = -1.0f64;
 
-    let templ_cx = knob_template.cols() as f64 / 2.0;
-    let templ_cy = knob_template.rows() as f64 / 2.0;
-
-    for &angle in angles {
-        // Rotate the template
-        let rot_mat = imgproc::get_rotation_matrix_2d(
-            Point2f::new(templ_cx as f32, templ_cy as f32),
-            -angle,
-            1.0,
-        )?;
-        let mut rotated = Mat::default();
-        imgproc::warp_affine(
-            knob_template,
-            &mut rotated,
-            &rot_mat,
-            Size::new(knob_template.cols(), knob_template.rows()),
-            imgproc::INTER_LINEAR,
-            BORDER_CONSTANT,
-            Scalar::default(),
-        )?;
-
-        if rotated.cols() > roi.cols() || rotated.rows() > roi.rows() {
+    for rt in templates {
+        if rt.mat.cols() > roi.cols() || rt.mat.rows() > roi.rows() {
             continue;
         }
 
         let mut result = Mat::default();
         imgproc::match_template(
             &roi,
-            &rotated,
+            &rt.mat,
             &mut result,
             imgproc::TM_CCOEFF_NORMED,
             &Mat::default(),
         )?;
 
-        // Find max value
-        let mut min_val = 0.0;
         let mut max_val = 0.0;
         opencv::core::min_max_loc(
             &result,
-            Some(&mut min_val),
+            None,
             Some(&mut max_val),
             None,
             None,
@@ -277,12 +286,10 @@ fn detect_single_template(
 
         if max_val > best_score {
             best_score = max_val;
-            best_angle = angle;
+            best_angle = rt.angle;
         }
     }
 
-    // Classify: angle 0 = OFF (template position), increasing angle = more ON
-    // The off_angle_deg should be 0 for template-based detection
     let state = classify_dial(best_angle, cfg.off_angle_deg, cfg.off_tolerance_deg);
 
     Ok(DialReading {

@@ -26,6 +26,7 @@ use oven_vision::pipeline::perspective::Perspective;
 use oven_vision::pipeline::sanity::{SanityCheck, quick_sanity_check};
 use oven_vision::pipeline::stage::CropRegion;
 use oven_vision::pipeline::refine_warp::RefineWarp;
+use oven_vision::pipeline::util::Templates;
 use oven_vision::pipeline::warp_check::WarpCheck;
 use oven_vision::pipeline::{self, Pipeline, PipelineError};
 use oven_vision::preprocess::preprocess;
@@ -91,6 +92,38 @@ async fn main() {
 
     // --- v2 Pipeline: calibrate or load cache ---
     let mut pipe = build_pipeline(&cfg);
+
+    // Stream debug images to disk as they're produced via a background writer
+    // task. The callback sends cloned data through a bounded channel so the
+    // pipeline thread never blocks on disk IO.
+    let (debug_tx, mut debug_rx) =
+        tokio::sync::mpsc::channel::<(usize, String, Vec<u8>)>(64);
+    {
+        let dir = capture_dir.clone();
+        tokio::spawn(async move {
+            while let Some((idx, label, jpeg)) = debug_rx.recv().await {
+                // Offload the blocking write to prevent stalling the async runtime
+                let dir = dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let filename = format!(
+                        "calibration_{:03}_{}.jpg",
+                        idx,
+                        label.replace(':', "_")
+                    );
+                    let path = dir.join(&filename);
+                    if let Err(err) = std::fs::write(&path, &jpeg) {
+                        eprintln!("failed to write debug image {filename}: {err}");
+                    }
+                });
+            }
+        });
+    }
+    pipe.set_debug_image_callback(move |idx, label, jpeg| {
+        // Clone the data and send it; if the channel is full, drop the image
+        // rather than blocking the pipeline thread.
+        let _ = debug_tx.try_send((idx, label.to_owned(), jpeg.to_vec()));
+    });
 
     let initial_frame = match fetch_frame(&client, &cfg.go2rtc_url).await {
         Ok(f) => f,
@@ -371,6 +404,8 @@ async fn main() {
 
 /// Build the 6-stage calibration pipeline from config.
 fn build_pipeline(cfg: &Config) -> Pipeline {
+    let templates = std::sync::Arc::new(Templates::load());
+    let find_features = std::sync::Arc::new(FindFeatures::new(templates.clone()));
     let stages: Vec<Box<dyn pipeline::Stage>> = vec![
         Box::new(match &cfg.pipeline.initial_crop {
             Some(crop) => FindStove::with_crop(CropRegion {
@@ -386,12 +421,12 @@ fn build_pipeline(cfg: &Config) -> Pipeline {
         Box::new(Perspective::new()),
         Box::new(WarpCheck::new()),
         Box::new(ExtractBand::new()),
-        Box::new(FindClock::new()),
-        Box::new(FindFeatures::new()),
+        Box::new(FindClock::new(templates.clone())),
+        Box::new(find_features.clone()),
         Box::new(SanityCheck::new()),
         Box::new(FindCorner::new()),
         Box::new(RefineWarp::new()),
-        Box::new(FinalDetect::new()),
+        Box::new(FinalDetect::new(find_features)),
         Box::new(FinalCheck::new()),
     ];
 
@@ -411,8 +446,10 @@ fn run_calibration(
     url: &str,
 ) -> Result<(), PipelineError> {
     let handle = tokio::runtime::Handle::current();
-    pipe.calibrate_with_fetch(|| {
-        tokio::task::block_in_place(|| handle.block_on(fetch_frame(client, url)))
+    let client = client.clone();
+    let url = url.to_owned();
+    pipe.calibrate_with_fetch(move || {
+        tokio::task::block_in_place(|| handle.block_on(fetch_frame(&client, &url)))
             .map_err(|e| PipelineError::Exhausted(format!("frame fetch: {e}")))
     })
 }

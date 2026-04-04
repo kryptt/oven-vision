@@ -1,16 +1,19 @@
-use opencv::core::{BORDER_CONSTANT, Mat, MatTraitConst, Point, Point2f, Scalar, Size};
-use opencv::imgcodecs;
+use std::sync::Arc;
+
+use opencv::core::{BORDER_CONSTANT, Mat, Point, Point2f, Scalar, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
+use rayon::prelude::*;
 
 use super::stage::{CircleFeature, DetectedFeatures, PipelineState, StageDescriptor, StageOutcome};
+use super::util::{Templates, enhance_gray};
 use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
 /// Expected knob count (excluding the clock).
 const EXPECTED_KNOBS: usize = 10;
 
-/// Template matching threshold (TM_CCORR_NORMED). Matches below this are ignored.
+/// Template matching threshold (TM_CCOEFF_NORMED). Matches below this are ignored.
 const MATCH_THRESHOLD: f64 = 0.35;
 
 /// Minimum distance between two accepted match positions (pixels in warped image).
@@ -24,9 +27,15 @@ const SCALE_FACTORS: [f64; 8] = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.15]
 /// Rotation step in degrees for knob template matching.
 const ROTATION_STEP_DEG: f64 = 10.0;
 
-/// Path to template images (bundled in container at build time).
-const KNOB_TEMPLATE_PATH: &str = "/templates/knob.jpg";
-const CLOCK_TEMPLATE_PATH: &str = "/templates/clock.jpg";
+/// A pre-computed edge template at a specific scale and rotation.
+struct PrecomputedEdgeTemplate {
+    edge: Mat,
+    angle: f64,
+    scale: f64,
+}
+
+/// Rayon thread count for parallel template matching (sweet spot on 16-core).
+const RAYON_THREADS: usize = 16;
 
 /// Stage 8: Detect features using multi-scale, multi-rotation template matching.
 ///
@@ -36,54 +45,67 @@ const CLOCK_TEMPLATE_PATH: &str = "/templates/clock.jpg";
 ///
 /// Coordinates are translated back using stored offsets from FindClock and
 /// ExtractBand.
+///
+/// Pre-computes all 8 scales × 36 rotations = 288 edge templates at
+/// construction to avoid redundant resize+rotate+canny per iteration.
 pub struct FindFeatures {
-    /// Knob template with CLAHE already applied (done once at construction).
-    knob_template: Mat,
-    /// Clock template with CLAHE already applied (done once at construction).
-    clock_template: Mat,
+    /// Shared CLAHE-enhanced templates.
+    templates: Arc<Templates>,
+    /// Pre-computed knob edge templates: Canny applied to the CLAHE template,
+    /// then rotated with INTER_NEAREST to preserve clean binary edges.
+    /// Indexed by scale_idx * n_rotations + rot_idx.
+    knob_edge_templates: Vec<PrecomputedEdgeTemplate>,
+    /// Dedicated rayon pool for parallel template matching.
+    pool: rayon::ThreadPool,
 }
 
 impl FindFeatures {
-    pub fn new() -> Self {
-        let mut clahe = imgproc::create_clahe(3.0, Size::new(8, 8)).unwrap();
+    pub fn new(templates: Arc<Templates>) -> Self {
+        // Pre-compute all edge templates: scale → Canny → rotate with INTER_NEAREST
+        let n_rotations = (360.0 / ROTATION_STEP_DEG) as i32;
+        let mut knob_edge_templates = Vec::new();
 
-        let knob_template = {
-            let raw = imgcodecs::imread(KNOB_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(%e, path = KNOB_TEMPLATE_PATH, "failed to load knob template, using empty");
-                    Mat::default()
-                });
-            if raw.empty() {
-                raw
-            } else {
-                let mut enhanced = Mat::default();
-                clahe.apply(&raw, &mut enhanced).unwrap_or_else(|e| {
-                    tracing::warn!(%e, "failed to apply CLAHE to knob template");
-                });
-                if enhanced.empty() { raw } else { enhanced }
+        if !templates.knob.empty() {
+            for &scale in &SCALE_FACTORS {
+                if let Ok(scaled) = resize_template(&templates.knob, scale) {
+                    if scaled.cols() < 5 || scaled.rows() < 5 {
+                        continue;
+                    }
+                    // Apply Canny FIRST (on the clean scaled template)
+                    let mut edge_scaled = Mat::default();
+                    if imgproc::canny(&scaled, &mut edge_scaled, 50.0, 150.0, 3, false).is_err() {
+                        continue;
+                    }
+                    // Then rotate the binary edge map with INTER_NEAREST
+                    for rot_idx in 0..n_rotations {
+                        let angle = rot_idx as f64 * ROTATION_STEP_DEG;
+                        if let Ok(rotated_edge) = rotate_edge_template(&edge_scaled, angle) {
+                            if !rotated_edge.empty() {
+                                knob_edge_templates.push(PrecomputedEdgeTemplate {
+                                    edge: rotated_edge,
+                                    angle,
+                                    scale,
+                                });
+                            }
+                        }
+                    }
+                }
             }
-        };
+            tracing::info!(count = knob_edge_templates.len(), "pre-computed knob edge templates");
+        }
 
-        let clock_template = {
-            let raw = imgcodecs::imread(CLOCK_TEMPLATE_PATH, imgcodecs::IMREAD_GRAYSCALE)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(%e, path = CLOCK_TEMPLATE_PATH, "failed to load clock template, using empty");
-                    Mat::default()
-                });
-            if raw.empty() {
-                raw
-            } else {
-                let mut enhanced = Mat::default();
-                clahe.apply(&raw, &mut enhanced).unwrap_or_else(|e| {
-                    tracing::warn!(%e, "failed to apply CLAHE to clock template");
-                });
-                if enhanced.empty() { raw } else { enhanced }
-            }
-        };
+        // Disable OpenCV internal threading — rayon owns parallelism.
+        let _ = opencv::core::set_num_threads(1);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_THREADS)
+            .build()
+            .expect("failed to build rayon thread pool");
 
         Self {
-            knob_template,
-            clock_template,
+            templates,
+            knob_edge_templates,
+            pool,
         }
     }
 }
@@ -107,7 +129,7 @@ impl Stage for FindFeatures {
         _raw: &Mat,
         iteration: u32,
     ) -> Result<(StageOutcome, ImageOutput), opencv::Error> {
-        if self.knob_template.empty() || self.clock_template.empty() {
+        if self.templates.knob.empty() || self.templates.clock.empty() {
             return Ok((
                 StageOutcome::Exhausted("template images not loaded".into()),
                 ImageOutput::Passthrough,
@@ -125,18 +147,7 @@ impl Stage for FindFeatures {
         let x_offset = search.x_min; // offset to translate back to band coords
         let y_offset = search.y_min; // offset to translate back to warped-image coords
 
-        // Convert to grayscale
-        let mut gray = Mat::default();
-        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-
-        // Enhance contrast
-        let mut enhanced = Mat::default();
-        let mut clahe = imgproc::create_clahe(3.0, Size::new(8, 8))?;
-        clahe.apply(&gray, &mut enhanced)?;
-
-        // Median blur before edge detection
-        let mut blurred = Mat::default();
-        imgproc::median_blur(&enhanced, &mut blurred, 3)?;
+        let blurred = enhance_gray(src, 3)?;
 
         // Edge detection on the working image
         let mut edge_img = Mat::default();
@@ -148,53 +159,52 @@ impl Stage for FindFeatures {
         let threshold_adj = (iteration as usize / SCALE_FACTORS.len()) as f64 * 0.05;
         let threshold = (MATCH_THRESHOLD - threshold_adj).max(0.15);
 
-        // --- Find knobs: multi-rotation edge-based template matching ---
-        let scaled_knob = resize_template(&self.knob_template, scale)?;
-        if scaled_knob.cols() < 5 || scaled_knob.rows() < 5 {
+        // --- Find knobs: use pre-computed edge templates for this scale ---
+        let templates_for_scale: Vec<&PrecomputedEdgeTemplate> = self
+            .knob_edge_templates
+            .iter()
+            .filter(|t| (t.scale - scale).abs() < 1e-6)
+            .collect();
+
+        if templates_for_scale.is_empty() {
             return Ok((
-                StageOutcome::Retry(format!("knob template too small at scale {scale:.2}")),
+                StageOutcome::Retry(format!("no pre-computed templates for scale {scale:.2}")),
                 ImageOutput::Passthrough,
             ));
         }
 
-        let mut all_knob_matches: Vec<TemplateMatch> = Vec::new();
+        // Parallel template matching across rotations using rayon.
+        let edge_ref = &edge_img;
+        let mut all_knob_matches: Vec<TemplateMatch> = self.pool.install(|| {
+            templates_for_scale
+                .par_iter()
+                .filter_map(|pct| {
+                    if pct.edge.cols() >= edge_ref.cols() || pct.edge.rows() >= edge_ref.rows() {
+                        return None;
+                    }
 
-        let n_rotations = (360.0 / ROTATION_STEP_DEG) as i32;
-        for rot_idx in 0..n_rotations {
-            let angle = rot_idx as f64 * ROTATION_STEP_DEG;
-            let rotated = rotate_template(&scaled_knob, angle)?;
-            if rotated.empty() {
-                continue;
-            }
+                    let mut result = Mat::default();
+                    imgproc::match_template(
+                        edge_ref,
+                        &pct.edge,
+                        &mut result,
+                        imgproc::TM_CCOEFF_NORMED,
+                        &Mat::default(),
+                    )
+                    .ok()?;
 
-            // Apply Canny to the rotated template (after scale and rotation)
-            let mut edge_templ = Mat::default();
-            imgproc::canny(&rotated, &mut edge_templ, 50.0, 150.0, 3, false)?;
+                    find_peaks(&result, threshold, pct.edge.cols(), pct.edge.rows(), pct.angle)
+                        .ok()
+                })
+                .flatten()
+                .collect()
+        });
 
-            // Skip if template is larger than image
-            if edge_templ.cols() >= edge_img.cols() || edge_templ.rows() >= edge_img.rows() {
-                continue;
-            }
-
-            let mut result = Mat::default();
-            imgproc::match_template(
-                &edge_img,
-                &edge_templ,
-                &mut result,
-                imgproc::TM_CCORR_NORMED,
-                &Mat::default(),
-            )?;
-
-            // Find peaks above threshold
-            let matches = find_peaks(
-                &result,
-                threshold,
-                edge_templ.cols(),
-                edge_templ.rows(),
-                angle,
-            )?;
-            all_knob_matches.extend(matches);
-        }
+        // Compute knob radius from first matching template
+        let knob_r = templates_for_scale
+            .first()
+            .map(|t| t.edge.cols() as f64 / 2.0)
+            .unwrap_or(10.0);
 
         if all_knob_matches.len() < EXPECTED_KNOBS {
             return Ok((
@@ -222,7 +232,7 @@ impl Stage for FindFeatures {
         }
 
         // --- Find clock: scale-only edge-based matching (no rotation) ---
-        let scaled_clock = resize_template(&self.clock_template, scale)?;
+        let scaled_clock = resize_template(&self.templates.clock, scale)?;
         let mut clock_match: Option<TemplateMatch> = None;
 
         if scaled_clock.cols() >= 5
@@ -238,7 +248,7 @@ impl Stage for FindFeatures {
                 &edge_img,
                 &edge_clock,
                 &mut result,
-                imgproc::TM_CCORR_NORMED,
+                imgproc::TM_CCOEFF_NORMED,
                 &Mat::default(),
             )?;
 
@@ -255,15 +265,12 @@ impl Stage for FindFeatures {
         }
 
         // --- Select the best 10+1 pattern from matches ---
-        let knob_r = scaled_knob.cols() as f64 / 2.0;
         let clock_r = scaled_clock.cols().max(scaled_clock.rows()) as f64 / 2.0;
 
         // Sort knob matches by score descending
         let mut sorted_knobs = knob_results;
         sorted_knobs.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.score.total_cmp(&a.score)
         });
 
         // Select top matches that are Y-aligned (best 10 by Y-consistency)
@@ -281,7 +288,7 @@ impl Stage for FindFeatures {
         // Translate coordinates back to warped-image space
         let knob_median_y = {
             let mut ys: Vec<f64> = knobs.iter().map(|k| k.center_y + y_offset).collect();
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ys.sort_by(|a, b| a.total_cmp(b));
             ys[ys.len() / 2]
         };
         let leftmost_knob_x = knobs
@@ -301,6 +308,10 @@ impl Stage for FindFeatures {
                 }
             } else {
                 // Clock match in wrong position -- synthesize from knob row
+                tracing::warn!(
+                    cm_x, cm_y = cm.y + y_offset, leftmost_knob_x,
+                    "clock match in wrong position, synthesizing from knob row"
+                );
                 CircleFeature {
                     center_x: leftmost_knob_x - knob_r * 4.0,
                     center_y: knob_median_y,
@@ -309,6 +320,7 @@ impl Stage for FindFeatures {
             }
         } else {
             // No clock match -- estimate position from knob row
+            tracing::warn!("no clock match, synthesizing position from knob row");
             CircleFeature {
                 center_x: leftmost_knob_x - knob_r * 4.0,
                 center_y: knob_median_y,
@@ -336,7 +348,7 @@ impl Stage for FindFeatures {
     }
 
     fn max_retries(&self) -> u32 {
-        30
+        10
     }
 
     fn debug_image(
@@ -438,8 +450,9 @@ fn resize_template(template: &Mat, scale: f64) -> Result<Mat, opencv::Error> {
     Ok(resized)
 }
 
-/// Rotate a grayscale template by the given angle in degrees.
-fn rotate_template(template: &Mat, angle_deg: f64) -> Result<Mat, opencv::Error> {
+/// Rotate a binary edge template by the given angle using INTER_NEAREST
+/// to preserve clean binary edges (no interpolation blur).
+fn rotate_edge_template(template: &Mat, angle_deg: f64) -> Result<Mat, opencv::Error> {
     let cx = template.cols() as f64 / 2.0;
     let cy = template.rows() as f64 / 2.0;
     let rot_mat =
@@ -451,7 +464,7 @@ fn rotate_template(template: &Mat, angle_deg: f64) -> Result<Mat, opencv::Error>
         &mut rotated,
         &rot_mat,
         Size::new(template.cols(), template.rows()),
-        imgproc::INTER_LINEAR,
+        imgproc::INTER_NEAREST,
         BORDER_CONSTANT,
         Scalar::default(),
     )?;
@@ -460,6 +473,7 @@ fn rotate_template(template: &Mat, angle_deg: f64) -> Result<Mat, opencv::Error>
 
 /// Find peaks in a matchTemplate result map above the threshold.
 /// Returns matches sorted by score descending.
+/// Uses row-pointer access to avoid per-pixel bounds checks.
 fn find_peaks(
     result: &Mat,
     threshold: f64,
@@ -468,20 +482,21 @@ fn find_peaks(
     angle: f64,
 ) -> Result<Vec<TemplateMatch>, opencv::Error> {
     let rows = result.rows();
-    let cols = result.cols();
+    let cols = result.cols() as usize;
     let half_w = templ_w as f64 / 2.0;
     let half_h = templ_h as f64 / 2.0;
+    let threshold_f32 = threshold as f32;
 
     let mut matches = Vec::new();
 
     for y in 0..rows {
-        for x in 0..cols {
-            let val = *result.at_2d::<f32>(y, x)? as f64;
-            if val >= threshold {
+        let row = result.at_row::<f32>(y)?;
+        for (x, &val) in row.iter().enumerate().take(cols) {
+            if val >= threshold_f32 {
                 matches.push(TemplateMatch {
                     x: x as f64 + half_w,
                     y: y as f64 + half_h,
-                    score: val,
+                    score: val as f64,
                     angle,
                 });
             }
@@ -489,9 +504,7 @@ fn find_peaks(
     }
 
     matches.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.score.total_cmp(&a.score)
     });
     Ok(matches)
 }
@@ -500,9 +513,7 @@ fn find_peaks(
 /// any that are within `min_dist` of a higher-scoring match.
 fn nms(matches: &mut Vec<TemplateMatch>, min_dist: f64) -> Vec<TemplateMatch> {
     matches.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.score.total_cmp(&a.score)
     });
 
     let mut kept: Vec<TemplateMatch> = Vec::new();
@@ -537,7 +548,7 @@ fn select_y_aligned_knobs(
 
     let unique_ys: Vec<f64> = {
         let mut ys: Vec<f64> = matches.iter().map(|m| m.y).collect();
-        ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ys.sort_by(|a, b| a.total_cmp(b));
         ys.dedup_by(|a, b| (*a - *b).abs() < 3.0);
         ys
     };
@@ -553,19 +564,17 @@ fn select_y_aligned_knobs(
         }
 
         // Sort by X
-        by_y.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        by_y.sort_by(|a, b| a.x.total_cmp(&b.x));
 
         // Take the best N by score among those that are Y-close
         let mut by_score: Vec<&TemplateMatch> = by_y.clone();
         by_score.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.score.total_cmp(&a.score)
         });
         by_score.truncate(n);
 
         // Re-sort by X
-        by_score.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        by_score.sort_by(|a, b| a.x.total_cmp(&b.x));
 
         // Check monotonic X with min gap
         let mut ok = true;

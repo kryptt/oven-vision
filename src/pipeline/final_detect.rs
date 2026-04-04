@@ -1,6 +1,6 @@
-use opencv::core::{Mat, Point, Rect, Scalar, Size};
-use opencv::imgproc;
-use opencv::prelude::*;
+use std::sync::Arc;
+
+use opencv::core::Mat;
 
 use super::find_features::FindFeatures;
 use super::stage::{PipelineState, StageDescriptor, StageOutcome};
@@ -12,21 +12,21 @@ pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     fallback: Some("RefineWarp"),
 };
 
-/// Stage S12: Final feature detection on the refined, inverted image.
+/// Stage S12: Final feature detection on the refined image.
 ///
 /// Delegates to FindFeatures' template matching logic but operates on
-/// the inverted+cropped image from S11. Since the image is already inverted,
-/// the edge-based matching should have improved contrast. Overwrites
-/// state.features with the refined positions.
+/// the cropped image from S11. Shares the same pre-computed edge templates
+/// as S8 to avoid duplicating the 288-template cache.
+///
+/// S11 updates knob_search offsets (y_min, x_min) to reflect the S11 crop
+/// origin, so FindFeatures translates coordinates correctly.
 pub struct FinalDetect {
-    inner: FindFeatures,
+    inner: Arc<FindFeatures>,
 }
 
 impl FinalDetect {
-    pub fn new() -> Self {
-        Self {
-            inner: FindFeatures::new(),
-        }
+    pub fn new(inner: Arc<FindFeatures>) -> Self {
+        Self { inner }
     }
 }
 
@@ -46,12 +46,15 @@ impl Stage for FinalDetect {
         // Clear previous features so FindFeatures runs fresh
         state.features = None;
 
-        // Delegate to the inner FindFeatures
+        // Delegate to the shared FindFeatures.
+        // S11 (RefineWarp) has already updated knob_search.y_min and
+        // knob_search.x_min to reflect the S11 crop origin, so
+        // FindFeatures will translate coordinates correctly.
         self.inner.run(state, src, dst, raw, iteration)
     }
 
     fn max_retries(&self) -> u32 {
-        30
+        10
     }
 
     fn debug_image(
@@ -60,7 +63,7 @@ impl Stage for FinalDetect {
         working: &Mat,
         raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        // Use the inner FindFeatures debug image but with our label
+        // Use the shared FindFeatures debug image but with our label
         if let Some((_, jpeg)) = self.inner.debug_image(state, working, raw)? {
             let n_knobs = state
                 .features

@@ -3,6 +3,7 @@ use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{PipelineState, StageDescriptor, StageOutcome};
+use super::util::{TOP_PADDING_FRAC, inter_line_distance};
 use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
@@ -58,10 +59,8 @@ impl Stage for ExtractBand {
         // The perspective stage maps the 4 corners to a rectangle where:
         //   top trim -> Y = top_pad
         //   bottom trim -> Y = top_pad + inter_line
-        let left_dist = (lines.bottom.y1 - lines.top.y1).abs();
-        let right_dist = (lines.bottom.y2 - lines.top.y2).abs();
-        let inter_line = (left_dist + right_dist) / 2.0;
-        let top_pad = inter_line * 0.5; // matches perspective.rs TOP_PADDING_FRAC
+        let inter_line = inter_line_distance(lines);
+        let top_pad = inter_line * TOP_PADDING_FRAC;
 
         let top_trim_y = top_pad;
         let bottom_trim_y = top_pad + inter_line;
@@ -114,8 +113,8 @@ impl Stage for ExtractBand {
         working: &Mat,
         _raw: &Mat,
     ) -> Result<Option<DebugImage>, opencv::Error> {
-        let (Some(_crop), Some(_persp), Some(search)) =
-            (&state.crop, &state.perspective, &state.knob_search)
+        let (Some(_crop), Some(_persp), Some(search), Some(lines)) =
+            (&state.crop, &state.perspective, &state.knob_search, &state.lines)
         else {
             return Ok(None);
         };
@@ -125,12 +124,8 @@ impl Stage for ExtractBand {
 
         // Draw the trim line positions within the band
         let green = Scalar::new(0.0, 255.0, 0.0, 0.0);
-
-        let lines = state.lines.as_ref().unwrap();
-        let left_dist = (lines.bottom.y1 - lines.top.y1).abs();
-        let right_dist = (lines.bottom.y2 - lines.top.y2).abs();
-        let inter_line = (left_dist + right_dist) / 2.0;
-        let top_pad = inter_line * 0.5;
+        let inter_line = inter_line_distance(lines);
+        let top_pad = inter_line * TOP_PADDING_FRAC;
         let top_y = (top_pad - search.y_min) as i32;
         let bot_y = (top_pad + inter_line - search.y_min) as i32;
 

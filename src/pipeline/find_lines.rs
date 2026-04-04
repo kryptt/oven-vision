@@ -5,7 +5,7 @@ use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{Line, LinePair, PipelineState, StageDescriptor, StageOutcome};
-use super::util::{cluster_average, cluster_by_rho, draw_line};
+use super::util::{cluster_average, cluster_by_rho, draw_line, enhance_gray};
 use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
@@ -40,10 +40,10 @@ impl FindLines {
 
     /// Canny / Hough thresholds. Relax every 5 pair-selection iterations.
     fn thresholds_for_iteration(iteration: u32) -> (f64, f64, i32) {
-        let thresh_step = iteration / 5;
-        let canny_low = (80.0 - thresh_step as f64 * 5.0).max(20.0);
-        let canny_high = (200.0 - thresh_step as f64 * 10.0).max(60.0);
-        let hough_threshold = (200 - thresh_step as i32 * 10).max(50);
+        let thresh_step = iteration / 3;
+        let canny_low = (80.0 - thresh_step as f64 * 6.0).max(20.0);
+        let canny_high = (200.0 - thresh_step as f64 * 14.0).max(60.0);
+        let hough_threshold = (200 - thresh_step as i32 * 15).max(80);
         (canny_low, canny_high, hough_threshold)
     }
 }
@@ -75,17 +75,7 @@ impl Stage for FindLines {
         };
 
         // src is already the cropped image from FindStove
-        let mut gray = Mat::default();
-        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-
-        // CLAHE before blur for better contrast enhancement
-        let mut enhanced = Mat::default();
-        let mut clahe = imgproc::create_clahe(3.0, Size::new(8, 8))?;
-        clahe.apply(&gray, &mut enhanced)?;
-
-        // Median blur after CLAHE to reduce salt-and-pepper noise from chrome reflections
-        let mut blurred = Mat::default();
-        imgproc::median_blur(&enhanced, &mut blurred, 5)?;
+        let blurred = enhance_gray(src, 5)?;
 
         let (canny_low, canny_high, hough_threshold) = Self::thresholds_for_iteration(iteration);
 
@@ -203,9 +193,7 @@ impl Stage for FindLines {
 
         // Sort by score descending (best first)
         candidates.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.score.total_cmp(&a.score)
         });
 
         // Pick the pair at index = iteration % 5 (cycles within each threshold group)
@@ -220,16 +208,18 @@ impl Stage for FindLines {
         let top_line = rho_theta_to_line(pick.top_rho, pick.top_theta, w);
         let bot_line = rho_theta_to_line(pick.bot_rho, pick.bot_theta, w);
 
+        let avg_theta = (pick.top_theta + pick.bot_theta) / 2.0;
         state.lines = Some(LinePair {
             top: top_line,
             bottom: bot_line,
+            avg_theta,
         });
 
         Ok((StageOutcome::Success, ImageOutput::Passthrough))
     }
 
     fn max_retries(&self) -> u32 {
-        30
+        15
     }
 
     fn debug_image(

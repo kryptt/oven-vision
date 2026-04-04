@@ -1,10 +1,11 @@
 use std::f64::consts::PI;
 
-use opencv::core::{Mat, Size, Vec2f, Vector};
+use opencv::core::{Mat, Vec2f, Vector};
 use opencv::imgproc;
 use opencv::prelude::*;
 
 use super::stage::{PipelineState, StageDescriptor, StageOutcome};
+use super::util::enhance_gray;
 use super::{ImageOutput, Stage};
 
 /// Maximum allowed mean angle deviation (degrees) from horizontal for the
@@ -34,7 +35,7 @@ impl WarpCheck {
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     name: "WarpCheck",
     label: "S5:WarpCheck",
-    fallback: Some("FindVerticals"),
+    fallback: Some("Perspective"),
 };
 
 impl Stage for WarpCheck {
@@ -57,20 +58,8 @@ impl Stage for WarpCheck {
             ));
         }
 
-        // Convert to grayscale
-        let mut gray = Mat::default();
-        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
+        let blurred = enhance_gray(src, 5)?;
 
-        // CLAHE for contrast enhancement
-        let mut enhanced = Mat::default();
-        let mut clahe = imgproc::create_clahe(3.0, Size::new(8, 8))?;
-        clahe.apply(&gray, &mut enhanced)?;
-
-        // Median blur to reduce noise
-        let mut blurred = Mat::default();
-        imgproc::median_blur(&enhanced, &mut blurred, 5)?;
-
-        // Edge detection
         let mut edges = Mat::default();
         imgproc::canny(&blurred, &mut edges, 50.0, 150.0, 3, false)?;
 
@@ -79,8 +68,11 @@ impl Stage for WarpCheck {
         imgproc::hough_lines_def(&edges, &mut lines, 1.0, PI / 180.0, 150)?;
 
         if lines.is_empty() {
-            // No strong lines detected -- can't validate, pass cautiously
-            return Ok((StageOutcome::Success, ImageOutput::Passthrough));
+            // No strong lines detected -- warped image may be blank/garbage
+            return Ok((
+                StageOutcome::Exhausted("no lines detected in warped image".into()),
+                ImageOutput::Passthrough,
+            ));
         }
 
         // Filter for near-horizontal lines (theta near PI/2)

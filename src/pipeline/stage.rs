@@ -23,6 +23,14 @@ pub struct Line {
 pub struct LinePair {
     pub top: Line,
     pub bottom: Line,
+    /// Average Hough theta of the pair (radians). Horizontal = PI/2.
+    /// Used by S3 to determine the expected perpendicular direction.
+    #[serde(default = "default_avg_theta")]
+    pub avg_theta: f64,
+}
+
+fn default_avg_theta() -> f64 {
+    std::f64::consts::FRAC_PI_2
 }
 
 /// The two dominant vertical reference lines from the stove panel edges.

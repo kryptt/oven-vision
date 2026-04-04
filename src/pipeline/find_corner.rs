@@ -1,8 +1,9 @@
-use opencv::core::{Mat, Point, Rect, Scalar, Size, CV_16S};
+use opencv::core::{Mat, Point, Scalar, CV_16S};
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use super::stage::{KnobSearchArea, PipelineState, StageDescriptor, StageOutcome};
+use super::stage::{PipelineState, StageDescriptor, StageOutcome};
+use super::util::median_radius;
 use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
@@ -70,19 +71,14 @@ impl Stage for FindCorner {
             .iter()
             .max_by(|a, b| {
                 a.center_x
-                    .partial_cmp(&b.center_x)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&b.center_x)
             })
             .unwrap();
 
         let mut ys: Vec<f64> = features.knobs.iter().map(|k| k.center_y).collect();
-        ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ys.sort_by(|a, b| a.total_cmp(b));
         let median_y = ys[ys.len() / 2];
-        let median_r = {
-            let mut rs: Vec<f64> = features.knobs.iter().map(|k| k.radius).collect();
-            rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            rs[rs.len() / 2]
-        };
+        let median_r = median_radius(&features.knobs);
 
         // --- Find the chrome bar Y: horizontal edge above the knob row ---
         // Search in a band above the knob centers
@@ -95,8 +91,19 @@ impl Stage for FindCorner {
             ));
         }
 
+        let mut gray_raw = Mat::default();
+        imgproc::cvt_color_def(src, &mut gray_raw, imgproc::COLOR_BGR2GRAY)?;
+
+        // Light Gaussian blur to reduce noise before Sobel
         let mut gray = Mat::default();
-        imgproc::cvt_color_def(src, &mut gray, imgproc::COLOR_BGR2GRAY)?;
+        imgproc::gaussian_blur(
+            &gray_raw,
+            &mut gray,
+            opencv::core::Size::new(3, 3),
+            0.0,
+            0.0,
+            opencv::core::BORDER_DEFAULT,
+        )?;
 
         // Sobel-Y to find horizontal edges
         let mut sobel_y = Mat::default();
@@ -129,7 +136,7 @@ impl Stage for FindCorner {
         let bar_row = row_profile
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
             .unwrap_or(0);
         let bar_y = (bar_search_top + bar_row as i32) as f64;
@@ -180,7 +187,7 @@ impl Stage for FindCorner {
         let wall_col = col_profile
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
             .unwrap_or(0);
         let wall_x = (wall_search_left + wall_col as i32) as f64;

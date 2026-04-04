@@ -1,8 +1,8 @@
-use opencv::core::{Mat, Point, Rect, Scalar, Size};
-use opencv::imgproc;
+use opencv::core::{Mat, Rect};
 use opencv::prelude::*;
 
 use super::stage::{PipelineState, StageDescriptor, StageOutcome};
+use super::util::median_radius;
 use super::{DebugImage, ImageOutput, Stage};
 use crate::annotate::encode_jpeg;
 
@@ -12,14 +12,11 @@ pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     fallback: Some("FindCorner"),
 };
 
-/// Stage S11: Crop to the oven panel using the detected corner, then
-/// invert colors for better template matching contrast.
+/// Stage S11: Crop to the oven panel using the detected corner.
 ///
-/// Uses the top-right corner (chrome bar × wall edge) from S10 to:
-/// 1. Crop the image to [0..corner_x, 0..knob_row_bottom]
-/// 2. Invert the colors (dark panel → bright, chrome knobs → dark)
-///
-/// The inverted, tightly-cropped image goes to S12 for final feature detection.
+/// Uses the top-right corner (chrome bar × wall edge) from S10 to crop the
+/// image to [0..corner_x, 0..knob_row_bottom]. The tightly-cropped image
+/// goes to S12 for final feature detection.
 pub struct RefineWarp;
 
 impl RefineWarp {
@@ -57,12 +54,15 @@ impl Stage for RefineWarp {
         let corner_x = ks.corner_x.unwrap_or(src.cols() as f64);
         let corner_y = ks.corner_y.unwrap_or(0.0);
 
+        if features.knobs.is_empty() {
+            return Ok((
+                StageOutcome::Exhausted("no knobs in features".into()),
+                ImageOutput::Passthrough,
+            ));
+        }
+
         // Compute the bottom of the knob row (lowest knob center + radius + margin)
-        let median_r = {
-            let mut rs: Vec<f64> = features.knobs.iter().map(|k| k.radius).collect();
-            rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            rs[rs.len() / 2]
-        };
+        let median_r = median_radius(&features.knobs);
         let max_knob_y = features
             .knobs
             .iter()
@@ -85,12 +85,16 @@ impl Stage for RefineWarp {
         // Crop
         let crop_rect = Rect::new(0, crop_top as i32, crop_w, crop_h);
         let cropped = Mat::roi(src, crop_rect)?;
+        cropped.copy_to(dst)?;
 
-        // Invert colors
-        let mut inverted = Mat::default();
-        opencv::core::bitwise_not(&cropped, &mut inverted, &Mat::default())?;
-
-        inverted.copy_to(dst)?;
+        // Update knob_search offsets so S12 (FinalDetect) translates
+        // coordinates back to warped-image space correctly.
+        // The S11 crop starts at (0, crop_top) in warped-image coords,
+        // and x_min=0 since we crop from x=0.
+        if let Some(ks) = state.knob_search.as_mut() {
+            ks.y_min = crop_top;
+            ks.x_min = 0.0;
+        }
 
         Ok((StageOutcome::Success, ImageOutput::Transformed))
     }
