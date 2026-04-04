@@ -17,7 +17,7 @@ const THRESHOLDS: SanityThresholds = SanityThresholds {
 
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     name: "FinalCheck",
-    label: "S13:FinalCheck",
+    label: "S12:FinalCheck",
     fallback: Some("FinalDetect"),
 };
 

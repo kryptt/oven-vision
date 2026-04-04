@@ -241,7 +241,6 @@ pub fn state_for_stage(name: &str) -> Option<PipelineState> {
         "FindClock" => Some(state_for_find_clock()),
         "FindFeatures" => Some(state_for_find_features()),
         "SanityCheck" => Some(state_for_sanity_check()),
-        "FindCorner" => Some(state_for_find_corner()),
         "RefineWarp" => Some(state_for_refine_warp()),
         "FinalDetect" => Some(state_for_final_detect()),
         "FinalCheck" => Some(state_for_final_check()),

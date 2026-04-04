@@ -8,7 +8,7 @@ use super::{DebugImage, ImageOutput, Stage};
 
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
     name: "FinalDetect",
-    label: "S12:FinalDetect",
+    label: "S11:FinalDetect",
     fallback: Some("RefineWarp"),
 };
 
@@ -76,7 +76,7 @@ impl Stage for FinalDetect {
                 .map(|f| f.clock.center_x)
                 .unwrap_or(0.0);
             Ok(Some((
-                format!("S12:FinalDetect_{n_knobs}k_clk{clk_x:.0}"),
+                format!("S11:FinalDetect_{n_knobs}k_clk{clk_x:.0}"),
                 jpeg,
             )))
         } else {

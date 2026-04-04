@@ -19,7 +19,6 @@ use oven_vision::pipeline::extract_band::ExtractBand;
 use oven_vision::pipeline::final_check::FinalCheck;
 use oven_vision::pipeline::final_detect::FinalDetect;
 use oven_vision::pipeline::find_clock::FindClock;
-use oven_vision::pipeline::find_corner::FindCorner;
 use oven_vision::pipeline::find_features::FindFeatures;
 use oven_vision::pipeline::find_lines::FindLines;
 use oven_vision::pipeline::find_stove::FindStove;
@@ -558,7 +557,6 @@ fn build_pipeline(cfg: &Config) -> Pipeline {
         Box::new(FindClock::new(templates.clone())),
         Box::new(find_features.clone()),
         Box::new(SanityCheck::new()),
-        Box::new(FindCorner::new()),
         Box::new(RefineWarp::new()),
         Box::new(FinalDetect::new(find_features)),
         Box::new(FinalCheck::new()),

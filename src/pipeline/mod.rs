@@ -3,7 +3,6 @@ pub mod extract_band;
 pub mod final_check;
 pub mod final_detect;
 pub mod find_clock;
-pub mod find_corner;
 pub mod find_features;
 pub mod find_lines;
 pub mod find_stove;
@@ -802,21 +801,15 @@ mod tests {
                 Some("FindFeatures"),
                 |_s| {},
             ),
-            mock_success("FindCorner", "S10:FindCorner", Some("FindFeatures"), |s| {
-                if let Some(ks) = s.knob_search.as_mut() {
-                    ks.corner_x = Some(700.0);
-                    ks.corner_y = Some(10.0);
-                }
-            }),
             mock_success(
                 "RefineWarp",
-                "S11:RefineWarp",
-                Some("FindCorner"),
+                "S10:RefineWarp",
+                Some("FindFeatures"),
                 |_s| {},
             ),
             mock_success(
                 "FinalDetect",
-                "S12:FinalDetect",
+                "S11:FinalDetect",
                 Some("RefineWarp"),
                 |s| {
                     s.features = Some(stage::DetectedFeatures {
@@ -838,7 +831,7 @@ mod tests {
             ),
             mock_success(
                 "FinalCheck",
-                "S13:FinalCheck",
+                "S12:FinalCheck",
                 Some("FinalDetect"),
                 |s| {
                     s.validated = true;

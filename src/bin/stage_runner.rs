@@ -19,7 +19,6 @@ use oven_vision::pipeline::extract_band::ExtractBand;
 use oven_vision::pipeline::final_check::FinalCheck;
 use oven_vision::pipeline::final_detect::FinalDetect;
 use oven_vision::pipeline::find_clock::FindClock;
-use oven_vision::pipeline::find_corner::FindCorner;
 use oven_vision::pipeline::find_features::FindFeatures;
 use oven_vision::pipeline::find_lines::FindLines;
 use oven_vision::pipeline::find_stove::FindStove;
@@ -387,7 +386,7 @@ fn cmd_list() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build all 13 stages in pipeline order with the given templates.
+/// Build all 12 stages in pipeline order with the given templates.
 fn build_all_stages(templates: Arc<Templates>) -> Vec<Box<dyn Stage>> {
     let find_features = Arc::new(FindFeatures::new(templates.clone()));
     vec![
@@ -400,7 +399,6 @@ fn build_all_stages(templates: Arc<Templates>) -> Vec<Box<dyn Stage>> {
         Box::new(FindClock::new(templates)),
         Box::new(find_features.clone()),
         Box::new(SanityCheck::new()),
-        Box::new(FindCorner::new()),
         Box::new(RefineWarp::new()),
         Box::new(FinalDetect::new(find_features)),
         Box::new(FinalCheck::new()),
@@ -464,7 +462,6 @@ fn run_full_pipeline(
         Box::new(FindClock::new(templates)),
         Box::new(find_features.clone()),
         Box::new(SanityCheck::new()),
-        Box::new(FindCorner::new()),
         Box::new(RefineWarp::new()),
         Box::new(FinalDetect::new(find_features)),
         Box::new(FinalCheck::new()),
