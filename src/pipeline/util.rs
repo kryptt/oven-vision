@@ -104,6 +104,8 @@ pub(super) struct SanityThresholds {
     pub max_gap_cv: f64,
     pub max_radius_factor: f64,
     pub expected_knobs: usize,
+    /// Skip the pairwise overlap check (coarse pass only — S13 enforces it).
+    pub skip_overlap: bool,
 }
 
 /// Measurements computed during validation, returned on success for logging.
@@ -161,7 +163,7 @@ pub(super) fn validate_features(
         }
     }
 
-    // Check 3b: no overlapping knobs
+    // Check 3b: no overlapping knobs (skipped in coarse pass)
     let mut min_pair_dist = f64::INFINITY;
     for i in 0..features.knobs.len() {
         for j in (i + 1)..features.knobs.len() {
@@ -171,11 +173,13 @@ pub(super) fn validate_features(
             if dist < min_pair_dist {
                 min_pair_dist = dist;
             }
-            let radii_sum = features.knobs[i].radius + features.knobs[j].radius;
-            if dist < radii_sum {
-                return Err(format!(
-                    "knobs {i}/{j} overlap: dist={dist:.1}px < radii_sum={radii_sum:.1}px"
-                ));
+            if !t.skip_overlap {
+                let radii_sum = features.knobs[i].radius + features.knobs[j].radius;
+                if dist < radii_sum {
+                    return Err(format!(
+                        "knobs {i}/{j} overlap: dist={dist:.1}px < radii_sum={radii_sum:.1}px"
+                    ));
+                }
             }
         }
     }

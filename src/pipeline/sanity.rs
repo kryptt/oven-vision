@@ -13,10 +13,11 @@ use super::{ImageOutput, Stage};
 /// is in S13 (FinalCheck).
 const THRESHOLDS: SanityThresholds = SanityThresholds {
     y_tolerance_px: 25.0,
-    min_x_gap_px: 10.0,
-    max_gap_cv: 0.50,
+    min_x_gap_px: 4.0,
+    max_gap_cv: 0.65,
     max_radius_factor: 2.0,
     expected_knobs: 10,
+    skip_overlap: true,
 };
 
 /// Stage 9: Validate the detected features are geometrically consistent.

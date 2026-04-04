@@ -12,6 +12,7 @@ const THRESHOLDS: SanityThresholds = SanityThresholds {
     max_gap_cv: 0.20,
     max_radius_factor: 1.2,
     expected_knobs: 10,
+    skip_overlap: false,
 };
 
 pub(crate) const DESCRIPTOR: StageDescriptor = StageDescriptor {
