@@ -28,7 +28,7 @@ impl Sanity {
             y_tolerance: kd.y_tolerance_px,
             size_tolerance: kd.size_tolerance_pct,
             spacing_tolerance: kd.spacing_tolerance_pct,
-            max_synthetic: 2, // allow up to 2 synthetic slots
+            max_synthetic: 3, // allow up to 3 synthetic slots
         }
     }
 

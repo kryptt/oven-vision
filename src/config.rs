@@ -7,7 +7,11 @@ pub struct Calibration {
     pub frame_size: [f64; 2],
     #[serde(default)]
     pub distortion_k1: f64,
+    #[serde(default)]
+    pub focal_length: f64,
     pub source_points: SourcePoints,
+    #[serde(default)]
+    pub knob_protrusion_z: f64,
     #[serde(default)]
     pub knob_detection: KnobDetection,
 }

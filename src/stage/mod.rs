@@ -1,5 +1,6 @@
 pub mod undistort;
 pub mod warp;
+pub mod reproject;
 pub mod enhance;
 pub mod detect;
 pub mod sanity;

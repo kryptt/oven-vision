@@ -212,7 +212,7 @@ impl Stage for Detect {
                 // to smooth out contour-center jitter while preserving real shifts
                 if !k.synthetic {
                     let slot_x = slot_xs[i];
-                    k.x = slot_x * 0.3 + k.x * 0.7; // blend: 70% detected, 30% prior
+                    k.x = slot_x * 0.5 + k.x * 0.5; // blend: 50% detected, 50% prior
                 }
                 k
             })

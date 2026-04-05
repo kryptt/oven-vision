@@ -2,11 +2,12 @@
   "description": "4-point perspective calibration for the oven knob panel. Source points are in raw 2560x1440 frame coordinates.",
   "frame_size": [2560, 1440],
   "distortion_k1": -0.4,
+  "focal_length": 2200.0,
   "source_points": {
     "top_left":     [1530.0, 1084.5],
     "bottom_left":  [1530.0, 1137.0],
-    "top_right":    [2122.0, 1035.0],
-    "bottom_right": [2105.0, 1089.5]
+    "top_right":    [2076.0, 1035.0],
+    "bottom_right": [2068.0, 1076.5]
   },
   "knob_detection": {
     "clahe_clip_limit": 3.0,

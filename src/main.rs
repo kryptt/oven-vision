@@ -13,8 +13,7 @@ use oven_vision::stage::annotate::Annotate;
 use oven_vision::stage::detect::Detect;
 use oven_vision::stage::enhance::Enhance;
 use oven_vision::stage::sanity::Sanity;
-use oven_vision::stage::undistort::Undistort;
-use oven_vision::stage::warp::Warp;
+use oven_vision::stage::reproject::Reproject;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,12 +32,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Loaded calibration: k1={}, {} knobs expected",
         calib.distortion_k1, calib.knob_detection.expected_count);
 
-    // Build pipeline
+    // Build pipeline — solvePnP handles undistortion + perspective in one remap pass
     let mut stages: Vec<Box<dyn Stage>> = Vec::new();
-    if let Some(undistort) = Undistort::new(&calib)? {
-        stages.push(Box::new(undistort));
-    }
-    stages.push(Box::new(Warp::new(&calib, 1200, 250)?));
+    stages.push(Box::new(Reproject::new(&calib, 1200, 250)?));
     stages.push(Box::new(Enhance::new(&calib.knob_detection)));
     stages.push(Box::new(Detect::new(&calib.knob_detection)));
     stages.push(Box::new(Sanity::new(&calib.knob_detection)));
@@ -169,6 +165,7 @@ fn save_stage_output(state: &FrameState, stage_name: &str, prefix: &str, params:
         "warp" => state.warped.as_ref(),
         "enhance" => state.enhanced.as_ref(),
         "annotate" => state.annotated.as_ref(),
+        "reproject" => state.warped.as_ref(),
         "detect" => state.debug_edges.as_ref(),
         _ => None,
     };
