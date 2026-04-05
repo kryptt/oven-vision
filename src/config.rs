@@ -1,195 +1,112 @@
 use serde::Deserialize;
-use std::{fmt, io};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Config {
-    pub go2rtc_url: String,
-    pub mqtt: MqttConfig,
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
-    pub dials: Vec<DialConfig>,
+pub struct Calibration {
+    pub frame_size: [f64; 2],
     #[serde(default)]
-    pub leds: Vec<LedConfig>,
+    pub distortion_k1: f64,
+    pub source_points: SourcePoints,
     #[serde(default)]
-    pub capture: CaptureConfig,
-    #[serde(default = "default_debug_port")]
-    pub debug_port: u16,
-    #[serde(default)]
-    pub pipeline: PipelineConfig,
+    pub knob_detection: KnobDetection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PipelineConfig {
-    /// Initial crop region hint (x, y, width, height). If omitted, uses a
-    /// built-in default covering the known stove panel area.
-    pub initial_crop: Option<CropConfig>,
-    /// Maximum fresh frames to try during calibration before giving up.
-    #[serde(default = "default_max_frame_attempts")]
-    pub max_frame_attempts: u32,
-    /// Path for the pipeline cache file.
-    #[serde(default = "default_cache_path")]
-    pub cache_path: String,
+pub struct SourcePoints {
+    pub top_left: [f64; 2],
+    pub bottom_left: [f64; 2],
+    pub top_right: [f64; 2],
+    pub bottom_right: [f64; 2],
 }
 
-impl Default for PipelineConfig {
+#[derive(Debug, Clone, Deserialize)]
+pub struct KnobDetection {
+    #[serde(default = "default_clahe_clip")]
+    pub clahe_clip_limit: f64,
+    #[serde(default = "default_clahe_grid")]
+    pub clahe_grid_size: i32,
+    #[serde(default = "default_dp")]
+    pub hough_dp: f64,
+    #[serde(default = "default_min_dist")]
+    pub hough_min_dist: f64,
+    #[serde(default = "default_param1")]
+    pub hough_param1: f64,
+    #[serde(default = "default_param2")]
+    pub hough_param2: f64,
+    #[serde(default = "default_min_r")]
+    pub hough_min_radius: i32,
+    #[serde(default = "default_max_r")]
+    pub hough_max_radius: i32,
+    #[serde(default = "default_count")]
+    pub expected_count: usize,
+    #[serde(default = "default_y_tol")]
+    pub y_tolerance_px: f32,
+    #[serde(default = "default_size_tol")]
+    pub size_tolerance_pct: f32,
+    #[serde(default = "default_spacing_tol")]
+    pub spacing_tolerance_pct: f32,
+    #[serde(default = "default_y_band_top")]
+    pub y_band_top: f32,
+    #[serde(default = "default_y_band_bottom")]
+    pub y_band_bottom: f32,
+    #[serde(default = "default_prior_x_start")]
+    pub prior_x_start: f32,
+    #[serde(default = "default_prior_x_end")]
+    pub prior_x_end: f32,
+    #[serde(default = "default_prior_y")]
+    pub prior_y: f32,
+    #[serde(default = "default_slot_capture_radius")]
+    pub slot_capture_radius: f32,
+}
+
+impl Default for KnobDetection {
     fn default() -> Self {
         Self {
-            initial_crop: None,
-            max_frame_attempts: default_max_frame_attempts(),
-            cache_path: default_cache_path(),
+            clahe_clip_limit: 3.0,
+            clahe_grid_size: 8,
+            hough_dp: 1.2,
+            hough_min_dist: 60.0,
+            hough_param1: 80.0,
+            hough_param2: 35.0,
+            hough_min_radius: 20,
+            hough_max_radius: 50,
+            expected_count: 10,
+            y_tolerance_px: 20.0,
+            size_tolerance_pct: 0.4,
+            spacing_tolerance_pct: 0.35,
+            y_band_top: 0.25,
+            y_band_bottom: 0.75,
+            prior_x_start: 50.0,
+            prior_x_end: 1150.0,
+            prior_y: 125.0,
+            slot_capture_radius: 55.0,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct CropConfig {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
+fn default_clahe_clip() -> f64 { 3.0 }
+fn default_clahe_grid() -> i32 { 8 }
+fn default_dp() -> f64 { 1.2 }
+fn default_min_dist() -> f64 { 60.0 }
+fn default_param1() -> f64 { 80.0 }
+fn default_param2() -> f64 { 35.0 }
+fn default_min_r() -> i32 { 20 }
+fn default_max_r() -> i32 { 50 }
+fn default_count() -> usize { 10 }
+fn default_y_tol() -> f32 { 20.0 }
+fn default_size_tol() -> f32 { 0.4 }
+fn default_spacing_tol() -> f32 { 0.35 }
+fn default_y_band_top() -> f32 { 0.25 }
+fn default_y_band_bottom() -> f32 { 0.75 }
+fn default_prior_x_start() -> f32 { 50.0 }
+fn default_prior_x_end() -> f32 { 1150.0 }
+fn default_prior_y() -> f32 { 125.0 }
+fn default_slot_capture_radius() -> f32 { 55.0 }
 
-fn default_max_frame_attempts() -> u32 {
-    5
-}
-
-fn default_cache_path() -> String {
-    "/data/captures/pipeline_cache.json".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MqttConfig {
-    pub host: String,
-    #[serde(default = "default_mqtt_port")]
-    pub port: u16,
-    pub user: Option<String>,
-    pub pass: Option<String>,
-    #[serde(default = "default_keepalive")]
-    pub keepalive_secs: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DialConfig {
-    pub label: String,
-    // NOTE: center_x, center_y, and radius are ignored in the v2 pipeline
-    // (positions come from self-calibration). Kept for label and tolerance use.
-    pub center_x: u32,
-    pub center_y: u32,
-    pub radius: u32,
-    pub off_angle_deg: f64,
-    #[serde(default = "default_tolerance")]
-    pub off_tolerance_deg: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LedConfig {
-    pub label: String,
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
-
-fn default_poll_interval() -> u64 {
-    5
-}
-
-fn default_mqtt_port() -> u16 {
-    1883
-}
-
-fn default_keepalive() -> u64 {
-    30
-}
-
-fn default_tolerance() -> f64 {
-    25.0
-}
-
-fn default_capture_dir() -> String {
-    "/data/captures".to_string()
-}
-
-fn default_max_files() -> usize {
-    200
-}
-
-fn default_capture_interval() -> u64 {
-    300
-}
-
-fn default_confidence_threshold() -> f64 {
-    0.25
-}
-
-fn default_debug_port() -> u16 {
-    8080
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CaptureConfig {
-    #[serde(default = "default_capture_dir")]
-    pub dir: String,
-    #[serde(default = "default_max_files")]
-    pub max_files: usize,
-    #[serde(default = "default_capture_interval")]
-    pub min_interval_secs: u64,
-    #[serde(default = "default_confidence_threshold")]
-    pub confidence_threshold: f64,
-}
-
-impl Default for CaptureConfig {
-    fn default() -> Self {
-        Self {
-            dir: default_capture_dir(),
-            max_files: default_max_files(),
-            min_interval_secs: default_capture_interval(),
-            confidence_threshold: default_confidence_threshold(),
-        }
+impl Calibration {
+    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let text = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&text)?)
     }
-}
-
-#[derive(Debug)]
-pub enum ConfigError {
-    EnvMissing,
-    ReadFile(io::Error),
-    Parse(serde_yaml::Error),
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EnvMissing => {
-                write!(f, "environment variable OVEN_VISION_CONFIG is not set")
-            }
-            Self::ReadFile(err) => write!(f, "failed to read config file: {err}"),
-            Self::Parse(err) => write!(f, "failed to parse config YAML: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::EnvMissing => None,
-            Self::ReadFile(err) => Some(err),
-            Self::Parse(err) => Some(err),
-        }
-    }
-}
-
-pub fn load() -> Result<Config, ConfigError> {
-    let path = std::env::var("OVEN_VISION_CONFIG").map_err(|_| ConfigError::EnvMissing)?;
-    let contents = std::fs::read_to_string(&path).map_err(ConfigError::ReadFile)?;
-    let mut config: Config = serde_yaml::from_str(&contents).map_err(ConfigError::Parse)?;
-
-    // Override MQTT credentials from environment if set (for K8s Secret injection)
-    if let Ok(user) = std::env::var("MQTT_USER") {
-        config.mqtt.user = Some(user);
-    }
-    if let Ok(pass) = std::env::var("MQTT_PASS") {
-        config.mqtt.pass = Some(pass);
-    }
-
-    Ok(config)
 }

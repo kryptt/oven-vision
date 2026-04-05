@@ -1,11 +1,2 @@
-pub mod annotate;
-pub mod capture;
-pub mod capture_store;
 pub mod config;
-pub mod debug_server;
-pub mod detect;
-pub mod led;
-pub mod mqtt;
-pub mod pipeline;
-pub mod preprocess;
-pub mod types;
+pub mod stage;

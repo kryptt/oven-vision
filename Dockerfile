@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1
 FROM alpine:3.21 AS builder
 
-# Build deps: OpenCV headers, clang for bindgen, build tools
 RUN apk add --no-cache \
     curl \
     build-base \
@@ -10,7 +9,6 @@ RUN apk add --no-cache \
     opencv-dev \
     pkgconf
 
-# Install rustup with latest stable (Alpine's apk Rust 1.83 is too old for edition 2024)
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH \
@@ -22,28 +20,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-COPY tests/ tests/
-
-# --- Test stage: docker buildx build --target test . ---
-FROM builder AS test
-COPY benches/ benches/
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    cargo test
-
-# --- Bench stage: verify benchmarks compile ---
-FROM builder AS bench
-COPY benches/ benches/
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    cargo bench --no-run
 
 # --- Release build ---
 FROM builder AS release
-COPY benches/ benches/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    cargo build --release --bin oven-vision --bin oven-vision-stages
+    cargo build --release --bin oven-vision
 
 # --- Runtime ---
 FROM alpine:3.21
@@ -51,9 +33,5 @@ FROM alpine:3.21
 RUN apk add --no-cache opencv libstdc++
 
 COPY --from=release /build/target/release/oven-vision /usr/local/bin/oven-vision
-COPY --from=release /build/target/release/oven-vision-stages /usr/local/bin/oven-vision-stages
-COPY templates/ /templates/
-
-EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/oven-vision"]
