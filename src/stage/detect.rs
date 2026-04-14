@@ -4,8 +4,8 @@ use opencv::core::{Mat, Point};
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use crate::config::KnobDetection;
 use super::{FrameState, Stage, StageError};
+use crate::config::KnobDetection;
 
 #[derive(Debug, Clone)]
 pub struct Knob {
@@ -45,11 +45,15 @@ impl Detect {
 }
 
 impl Stage for Detect {
-    fn name(&self) -> &'static str { "detect" }
+    fn name(&self) -> &'static str {
+        "detect"
+    }
 
     fn process(&self, state: &mut FrameState) -> Result<(), StageError> {
-        let input = state.enhanced.as_ref()
-            .ok_or(StageError { stage: self.name(), message: "no enhanced frame".into() })?;
+        let input = state.enhanced.as_ref().ok_or(StageError {
+            stage: self.name(),
+            message: "no enhanced frame".into(),
+        })?;
 
         let img_h = input.rows() as f32;
         let y_top = self.y_band_top * img_h;
@@ -58,34 +62,85 @@ impl Stage for Detect {
         // Adaptive Canny thresholds from gradient magnitude
         let mut grad_x = Mat::default();
         let mut grad_y = Mat::default();
-        imgproc::sobel(input, &mut grad_x, opencv::core::CV_16S, 1, 0, 3, 1.0, 0.0, opencv::core::BORDER_DEFAULT)
-            .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
-        imgproc::sobel(input, &mut grad_y, opencv::core::CV_16S, 0, 1, 3, 1.0, 0.0, opencv::core::BORDER_DEFAULT)
-            .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+        imgproc::sobel(
+            input,
+            &mut grad_x,
+            opencv::core::CV_16S,
+            1,
+            0,
+            3,
+            1.0,
+            0.0,
+            opencv::core::BORDER_DEFAULT,
+        )
+        .map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
+        imgproc::sobel(
+            input,
+            &mut grad_y,
+            opencv::core::CV_16S,
+            0,
+            1,
+            3,
+            1.0,
+            0.0,
+            opencv::core::BORDER_DEFAULT,
+        )
+        .map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
         let mut abs_x = Mat::default();
         let mut abs_y = Mat::default();
-        opencv::core::convert_scale_abs(&grad_x, &mut abs_x, 1.0, 0.0)
-            .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
-        opencv::core::convert_scale_abs(&grad_y, &mut abs_y, 1.0, 0.0)
-            .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
-        let mean_x = opencv::core::mean(&abs_x, &Mat::default())
-            .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
-        let mean_y_val = opencv::core::mean(&abs_y, &Mat::default())
-            .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+        opencv::core::convert_scale_abs(&grad_x, &mut abs_x, 1.0, 0.0).map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
+        opencv::core::convert_scale_abs(&grad_y, &mut abs_y, 1.0, 0.0).map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
+        let mean_x = opencv::core::mean(&abs_x, &Mat::default()).map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
+        let mean_y_val = opencv::core::mean(&abs_y, &Mat::default()).map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
         let mean_grad = (mean_x[0] + mean_y_val[0]) / 2.0;
 
         let mut edges = Mat::default();
-        imgproc::canny(input, &mut edges, mean_grad * 0.5, mean_grad * 1.5, 3, false)
-            .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+        imgproc::canny(
+            input,
+            &mut edges,
+            mean_grad * 0.5,
+            mean_grad * 1.5,
+            3,
+            false,
+        )
+        .map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
 
         state.debug_edges = Some(edges.clone());
 
         // Find contours
         let mut contours = opencv::core::Vector::<opencv::core::Vector<Point>>::new();
         imgproc::find_contours(
-            &edges, &mut contours,
-            imgproc::RETR_LIST, imgproc::CHAIN_APPROX_NONE, Point::new(0, 0),
-        ).map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+            &edges,
+            &mut contours,
+            imgproc::RETR_LIST,
+            imgproc::CHAIN_APPROX_NONE,
+            Point::new(0, 0),
+        )
+        .map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
 
         // Filter contours into candidates
         let min_perim = std::f64::consts::PI * self.min_radius as f64;
@@ -94,22 +149,36 @@ impl Stage for Detect {
         let mut candidates: Vec<Knob> = Vec::new();
 
         for i in 0..contours.len() {
-            let contour = contours.get(i)
-                .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
-            if contour.len() < 5 { continue; }
+            let contour = contours.get(i).map_err(|e| StageError {
+                stage: self.name(),
+                message: e.to_string(),
+            })?;
+            if contour.len() < 5 {
+                continue;
+            }
 
-            let perim = imgproc::arc_length(&contour, true)
-                .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
-            if perim < min_perim || perim > max_perim { continue; }
+            let perim = imgproc::arc_length(&contour, true).map_err(|e| StageError {
+                stage: self.name(),
+                message: e.to_string(),
+            })?;
+            if perim < min_perim || perim > max_perim {
+                continue;
+            }
 
-            let ellipse = imgproc::fit_ellipse(&contour)
-                .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+            let ellipse = imgproc::fit_ellipse(&contour).map_err(|e| StageError {
+                stage: self.name(),
+                message: e.to_string(),
+            })?;
 
             let r_avg = (ellipse.size.width + ellipse.size.height) / 4.0;
-            if r_avg < self.min_radius * 0.6 || r_avg > self.max_radius * 1.5 { continue; }
+            if r_avg < self.min_radius * 0.6 || r_avg > self.max_radius * 1.5 {
+                continue;
+            }
 
             // Y-band filter
-            if ellipse.center.y < y_top || ellipse.center.y > y_bot { continue; }
+            if ellipse.center.y < y_top || ellipse.center.y > y_bot {
+                continue;
+            }
 
             // Axis ratio: reject very elongated shapes
             let (major, minor) = if ellipse.size.width > ellipse.size.height {
@@ -117,7 +186,9 @@ impl Stage for Detect {
             } else {
                 (ellipse.size.height, ellipse.size.width)
             };
-            if minor > 0.0 && major / minor > 2.5 { continue; }
+            if minor > 0.0 && major / minor > 2.5 {
+                continue;
+            }
 
             candidates.push(Knob {
                 x: ellipse.center.x,
@@ -131,14 +202,20 @@ impl Stage for Detect {
         // --- Spatial prior: assign candidates to expected slot positions ---
         let n = self.expected_count;
         let slot_xs: Vec<f32> = (0..n)
-            .map(|i| self.prior_x_start + i as f32 * (self.prior_x_end - self.prior_x_start) / (n - 1) as f32)
+            .map(|i| {
+                self.prior_x_start
+                    + i as f32 * (self.prior_x_end - self.prior_x_start) / (n - 1) as f32
+            })
             .collect();
 
         let median_radius: f32 = {
             let mut rs: Vec<f32> = candidates.iter().map(|c| c.radius).collect();
             rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            if rs.is_empty() { (self.min_radius + self.max_radius) / 2.0 }
-            else { rs[rs.len() / 2] }
+            if rs.is_empty() {
+                (self.min_radius + self.max_radius) / 2.0
+            } else {
+                rs[rs.len() / 2]
+            }
         };
 
         let capture_r = self.slot_capture_radius;
@@ -147,9 +224,13 @@ impl Stage for Detect {
         let mut used: HashSet<usize> = HashSet::new();
 
         for (slot_idx, &sx) in slot_xs.iter().enumerate() {
-            let best = candidates.iter().enumerate()
+            let best = candidates
+                .iter()
+                .enumerate()
                 .filter(|(ci, c)| {
-                    if used.contains(ci) { return false; }
+                    if used.contains(ci) {
+                        return false;
+                    }
                     let dx = c.x - sx;
                     let dy = c.y - prior_y;
                     (dx * dx + dy * dy).sqrt() < capture_r
@@ -175,9 +256,7 @@ impl Stage for Detect {
         }
 
         // Compute median radius and Y from assigned (real) knobs for normalization
-        let real_knobs: Vec<&Knob> = assigned.iter()
-            .filter_map(|a| a.as_ref())
-            .collect();
+        let real_knobs: Vec<&Knob> = assigned.iter().filter_map(|a| a.as_ref()).collect();
 
         let norm_radius = if real_knobs.is_empty() {
             median_radius
@@ -219,8 +298,13 @@ impl Stage for Detect {
             .collect();
 
         let synthetic_count = knobs.iter().filter(|k| k.synthetic).count();
-        eprintln!("  detect: contours={} candidates={} assigned={}/{}",
-            contours.len(), candidates.len(), n - synthetic_count, n);
+        eprintln!(
+            "  detect: contours={} candidates={} assigned={}/{}",
+            contours.len(),
+            candidates.len(),
+            n - synthetic_count,
+            n
+        );
 
         state.knobs = knobs;
         Ok(())

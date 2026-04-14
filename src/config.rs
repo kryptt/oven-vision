@@ -89,24 +89,60 @@ impl Default for KnobDetection {
     }
 }
 
-fn default_clahe_clip() -> f64 { 3.0 }
-fn default_clahe_grid() -> i32 { 8 }
-fn default_dp() -> f64 { 1.2 }
-fn default_min_dist() -> f64 { 60.0 }
-fn default_param1() -> f64 { 80.0 }
-fn default_param2() -> f64 { 35.0 }
-fn default_min_r() -> i32 { 20 }
-fn default_max_r() -> i32 { 50 }
-fn default_count() -> usize { 10 }
-fn default_y_tol() -> f32 { 20.0 }
-fn default_size_tol() -> f32 { 0.4 }
-fn default_spacing_tol() -> f32 { 0.35 }
-fn default_y_band_top() -> f32 { 0.25 }
-fn default_y_band_bottom() -> f32 { 0.75 }
-fn default_prior_x_start() -> f32 { 50.0 }
-fn default_prior_x_end() -> f32 { 1150.0 }
-fn default_prior_y() -> f32 { 125.0 }
-fn default_slot_capture_radius() -> f32 { 55.0 }
+fn default_clahe_clip() -> f64 {
+    3.0
+}
+fn default_clahe_grid() -> i32 {
+    8
+}
+fn default_dp() -> f64 {
+    1.2
+}
+fn default_min_dist() -> f64 {
+    60.0
+}
+fn default_param1() -> f64 {
+    80.0
+}
+fn default_param2() -> f64 {
+    35.0
+}
+fn default_min_r() -> i32 {
+    20
+}
+fn default_max_r() -> i32 {
+    50
+}
+fn default_count() -> usize {
+    10
+}
+fn default_y_tol() -> f32 {
+    20.0
+}
+fn default_size_tol() -> f32 {
+    0.4
+}
+fn default_spacing_tol() -> f32 {
+    0.35
+}
+fn default_y_band_top() -> f32 {
+    0.25
+}
+fn default_y_band_bottom() -> f32 {
+    0.75
+}
+fn default_prior_x_start() -> f32 {
+    50.0
+}
+fn default_prior_x_end() -> f32 {
+    1150.0
+}
+fn default_prior_y() -> f32 {
+    125.0
+}
+fn default_slot_capture_radius() -> f32 {
+    55.0
+}
 
 impl Calibration {
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {

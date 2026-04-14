@@ -1,10 +1,10 @@
-use opencv::core::{Mat, Point2f, Point3f, Scalar, Size, Vector, CV_32FC1};
 use opencv::calib3d;
+use opencv::core::{CV_32FC1, Mat, Point2f, Point3f, Scalar, Size, Vector};
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use crate::config::Calibration;
 use super::{FrameState, Stage, StageError};
+use crate::config::Calibration;
 
 /// 3D-aware reprojection that corrects both lens distortion and foreshortening
 /// of protruding knob caps in a single remap pass.
@@ -32,12 +32,13 @@ impl Reproject {
         let k1 = calib.distortion_k1;
 
         // Camera intrinsics — focal_length overrides fw if set
-        let fx = if calib.focal_length > 0.0 { calib.focal_length } else { fw };
-        let camera_matrix = Mat::from_slice_2d(&[
-            &[fx, 0.0, fw / 2.0],
-            &[0.0, fx, fh / 2.0],
-            &[0.0, 0.0, 1.0],
-        ])?;
+        let fx = if calib.focal_length > 0.0 {
+            calib.focal_length
+        } else {
+            fw
+        };
+        let camera_matrix =
+            Mat::from_slice_2d(&[&[fx, 0.0, fw / 2.0], &[0.0, fx, fh / 2.0], &[0.0, 0.0, 1.0]])?;
 
         eprintln!("  reproject: fx={} cx={} cy={}", fx, fw / 2.0, fh / 2.0);
         let dist_arr = [k1, 0.0, 0.0, 0.0, 0.0];
@@ -46,10 +47,10 @@ impl Reproject {
         // Object points: panel corners in world coordinates.
         // Use output pixel coordinates so 1 world unit = 1 output pixel.
         let obj_pts = Mat::from_slice_2d(&[
-            &[0.0f32, 0.0, 0.0],                            // TL
-            &[dst_w as f32, 0.0, 0.0],                      // TR
-            &[dst_w as f32, dst_h as f32, 0.0],              // BR
-            &[0.0, dst_h as f32, 0.0],                       // BL
+            &[0.0f32, 0.0, 0.0],                // TL
+            &[dst_w as f32, 0.0, 0.0],          // TR
+            &[dst_w as f32, dst_h as f32, 0.0], // BR
+            &[0.0, dst_h as f32, 0.0],          // BL
         ])?;
 
         // Image points: where these corners appear in the raw camera frame
@@ -74,7 +75,10 @@ impl Reproject {
             calib3d::SOLVEPNP_IPPE, // designed for coplanar points
         )?;
 
-        eprintln!("  reproject: solvePnP converged, building {}x{} remap", dst_w, dst_h);
+        eprintln!(
+            "  reproject: solvePnP converged, building {}x{} remap",
+            dst_w, dst_h
+        );
 
         // Build remap: for each output pixel, compute 3D world point and project
         // to source image. The knob row gets Z=protrusion_z, panel surface gets Z=0.
@@ -107,12 +111,8 @@ impl Reproject {
         )?;
 
         // Fill remap tables
-        let mut map_x = Mat::new_rows_cols_with_default(
-            dst_h, dst_w, CV_32FC1, Scalar::all(0.0),
-        )?;
-        let mut map_y = Mat::new_rows_cols_with_default(
-            dst_h, dst_w, CV_32FC1, Scalar::all(0.0),
-        )?;
+        let mut map_x = Mat::new_rows_cols_with_default(dst_h, dst_w, CV_32FC1, Scalar::all(0.0))?;
+        let mut map_y = Mat::new_rows_cols_with_default(dst_h, dst_w, CV_32FC1, Scalar::all(0.0))?;
 
         for v in 0..dst_h {
             for u in 0..dst_w {
@@ -125,12 +125,19 @@ impl Reproject {
 
         eprintln!("  reproject: remap built");
 
-        Ok(Self { map_x, map_y, dst_w, dst_h })
+        Ok(Self {
+            map_x,
+            map_y,
+            dst_w,
+            dst_h,
+        })
     }
 }
 
 impl Stage for Reproject {
-    fn name(&self) -> &'static str { "reproject" }
+    fn name(&self) -> &'static str {
+        "reproject"
+    }
 
     fn process(&self, state: &mut FrameState) -> Result<(), StageError> {
         let mut warped = Mat::default();

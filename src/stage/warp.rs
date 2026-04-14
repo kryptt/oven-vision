@@ -1,9 +1,9 @@
-use opencv::core::{Mat, Point2f, Scalar, Size, BORDER_CONSTANT};
+use opencv::core::{BORDER_CONSTANT, Mat, Point2f, Scalar, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
 
-use crate::config::Calibration;
 use super::{FrameState, Stage, StageError};
+use crate::config::Calibration;
 
 pub struct Warp {
     transform: Mat,
@@ -12,7 +12,11 @@ pub struct Warp {
 }
 
 impl Warp {
-    pub fn new(calib: &Calibration, dst_w: i32, dst_h: i32) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        calib: &Calibration,
+        dst_w: i32,
+        dst_h: i32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let sp = &calib.source_points;
         let src_pts = Mat::from_slice_2d(&[
             &[sp.top_left[0] as f32, sp.top_left[1] as f32],
@@ -27,12 +31,18 @@ impl Warp {
             &[0.0, dst_h as f32],
         ])?;
         let transform = imgproc::get_perspective_transform(&src_pts, &dst_pts, 0)?;
-        Ok(Self { transform, dst_w, dst_h })
+        Ok(Self {
+            transform,
+            dst_w,
+            dst_h,
+        })
     }
 }
 
 impl Stage for Warp {
-    fn name(&self) -> &'static str { "warp" }
+    fn name(&self) -> &'static str {
+        "warp"
+    }
 
     fn process(&self, state: &mut FrameState) -> Result<(), StageError> {
         let input = state.undistorted.as_ref().unwrap_or(&state.raw);
@@ -46,7 +56,10 @@ impl Stage for Warp {
             BORDER_CONSTANT,
             Scalar::default(),
         )
-        .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+        .map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
         state.warped = Some(out);
         Ok(())
     }

@@ -8,12 +8,12 @@ use opencv::prelude::*;
 use tokio_stream::StreamExt;
 
 use oven_vision::config::Calibration;
-use oven_vision::stage::{FrameState, Stage};
 use oven_vision::stage::annotate::Annotate;
 use oven_vision::stage::detect::Detect;
 use oven_vision::stage::enhance::Enhance;
-use oven_vision::stage::sanity::Sanity;
 use oven_vision::stage::reproject::Reproject;
+use oven_vision::stage::sanity::Sanity;
+use oven_vision::stage::{FrameState, Stage};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,8 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let save_stages = std::env::var("SAVE_STAGES").unwrap_or_default() == "1";
 
     let calib = Calibration::load(&PathBuf::from(&calib_path))?;
-    eprintln!("Loaded calibration: k1={}, {} knobs expected",
-        calib.distortion_k1, calib.knob_detection.expected_count);
+    eprintln!(
+        "Loaded calibration: k1={}, {} knobs expected",
+        calib.distortion_k1, calib.knob_detection.expected_count
+    );
 
     // Build pipeline — solvePnP handles undistortion + perspective in one remap pass
     let mut stages: Vec<Box<dyn Stage>> = Vec::new();
@@ -40,10 +42,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stages.push(Box::new(Sanity::new(&calib.knob_detection)));
     stages.push(Box::new(Annotate));
 
-    eprintln!("Pipeline: {}",
-        stages.iter().enumerate()
+    eprintln!(
+        "Pipeline: {}",
+        stages
+            .iter()
+            .enumerate()
             .map(|(i, s)| format!("s{}_{}", i + 1, s.name()))
-            .collect::<Vec<_>>().join(" → "));
+            .collect::<Vec<_>>()
+            .join(" → ")
+    );
 
     fs::create_dir_all(&output_dir)?;
 
@@ -111,15 +118,22 @@ async fn fetch_frame(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<Mat, Box<dyn std::error::Error + Send>> {
-    let bytes = client.get(url).send().await
+    let bytes = client
+        .get(url)
+        .send()
+        .await
         .map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?
-        .bytes().await
+        .bytes()
+        .await
         .map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
     let buf = Vector::from_slice(&bytes);
     let frame = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR)
         .map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
     if frame.empty() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty frame")));
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty frame",
+        )));
     }
     Ok(frame)
 }
@@ -139,7 +153,13 @@ fn run_pipeline(
         stage.process(&mut state)?;
 
         if save_stages {
-            let prefix = format!("{}/f{:02}_s{}_{}", output_dir, frame_num, i + 1, stage.name());
+            let prefix = format!(
+                "{}/f{:02}_s{}_{}",
+                output_dir,
+                frame_num,
+                i + 1,
+                stage.name()
+            );
             save_stage_output(&state, stage.name(), &prefix, &params);
         }
     }

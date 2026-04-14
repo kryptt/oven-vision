@@ -14,6 +14,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use opencv::core::Mat;
 use opencv::prelude::*;
 
+use oven_vision::pipeline::Stage;
 use oven_vision::pipeline::extract_band::ExtractBand;
 use oven_vision::pipeline::final_check::FinalCheck;
 use oven_vision::pipeline::final_detect::FinalDetect;
@@ -30,7 +31,6 @@ use oven_vision::pipeline::stage::PipelineState;
 use oven_vision::pipeline::testdata;
 use oven_vision::pipeline::util::Templates;
 use oven_vision::pipeline::warp_check::WarpCheck;
-use oven_vision::pipeline::Stage;
 
 /// Try to load a real fixture image; fall back to a synthetic frame.
 fn load_test_image() -> Mat {

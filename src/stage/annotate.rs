@@ -7,11 +7,15 @@ use super::{FrameState, Stage, StageError};
 pub struct Annotate;
 
 impl Stage for Annotate {
-    fn name(&self) -> &'static str { "annotate" }
+    fn name(&self) -> &'static str {
+        "annotate"
+    }
 
     fn process(&self, state: &mut FrameState) -> Result<(), StageError> {
-        let warped = state.warped.as_ref()
-            .ok_or(StageError { stage: self.name(), message: "no warped frame".into() })?;
+        let warped = state.warped.as_ref().ok_or(StageError {
+            stage: self.name(),
+            message: "no warped frame".into(),
+        })?;
         let mut out = warped.clone();
         let h = out.rows();
 
@@ -26,27 +30,59 @@ impl Stage for Annotate {
 
             if knob.synthetic {
                 // Synthetic: red dashed (draw as thin dotted circle)
-                imgproc::circle(&mut out, center, r, red, 1, imgproc::LINE_AA, 0)
-                    .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+                imgproc::circle(&mut out, center, r, red, 1, imgproc::LINE_AA, 0).map_err(|e| {
+                    StageError {
+                        stage: self.name(),
+                        message: e.to_string(),
+                    }
+                })?;
                 let label = format!("?{}", knob.slot + 1);
                 imgproc::put_text(
-                    &mut out, &label,
+                    &mut out,
+                    &label,
                     Point::new(knob.x as i32 - 10, knob.y as i32 - r - 6),
-                    imgproc::FONT_HERSHEY_SIMPLEX, 0.4, red, 1, imgproc::LINE_AA, false,
-                ).map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+                    imgproc::FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    red,
+                    1,
+                    imgproc::LINE_AA,
+                    false,
+                )
+                .map_err(|e| StageError {
+                    stage: self.name(),
+                    message: e.to_string(),
+                })?;
             } else {
                 // Real: green/orange solid circle
                 let color = if pass { green } else { orange };
-                imgproc::circle(&mut out, center, r, color, 2, imgproc::LINE_AA, 0)
-                    .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
-                imgproc::circle(&mut out, center, 3, color, -1, imgproc::LINE_AA, 0)
-                    .map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+                imgproc::circle(&mut out, center, r, color, 2, imgproc::LINE_AA, 0).map_err(
+                    |e| StageError {
+                        stage: self.name(),
+                        message: e.to_string(),
+                    },
+                )?;
+                imgproc::circle(&mut out, center, 3, color, -1, imgproc::LINE_AA, 0).map_err(
+                    |e| StageError {
+                        stage: self.name(),
+                        message: e.to_string(),
+                    },
+                )?;
                 let label = format!("{}", knob.slot + 1);
                 imgproc::put_text(
-                    &mut out, &label,
+                    &mut out,
+                    &label,
                     Point::new(knob.x as i32 - 6, knob.y as i32 - r - 6),
-                    imgproc::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, imgproc::LINE_AA, false,
-                ).map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+                    imgproc::FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                    imgproc::LINE_AA,
+                    false,
+                )
+                .map_err(|e| StageError {
+                    stage: self.name(),
+                    message: e.to_string(),
+                })?;
             }
         }
 
@@ -64,10 +100,20 @@ impl Stage for Annotate {
         );
         let color = if pass { green } else { orange };
         imgproc::put_text(
-            &mut out, &status,
+            &mut out,
+            &status,
             Point::new(10, h - 10),
-            imgproc::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, imgproc::LINE_AA, false,
-        ).map_err(|e| StageError { stage: self.name(), message: e.to_string() })?;
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            imgproc::LINE_AA,
+            false,
+        )
+        .map_err(|e| StageError {
+            stage: self.name(),
+            message: e.to_string(),
+        })?;
 
         state.annotated = Some(out);
         Ok(())

@@ -1,4 +1,4 @@
-use oven_vision::detect::{classify_dial, DialState, HeatLevel};
+use oven_vision::detect::{DialState, HeatLevel, classify_dial};
 
 #[test]
 fn classify_at_off_position() {

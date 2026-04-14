@@ -1,10 +1,10 @@
+pub mod annotate;
+pub mod detect;
+pub mod enhance;
+pub mod reproject;
+pub mod sanity;
 pub mod undistort;
 pub mod warp;
-pub mod reproject;
-pub mod enhance;
-pub mod detect;
-pub mod sanity;
-pub mod annotate;
 
 use opencv::core::Mat;
 
