@@ -20,6 +20,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY tests/ tests/
+COPY benches/ benches/
+
+# --- Test ---
+FROM builder AS test
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    cargo test --all-features
 
 # --- Release build ---
 FROM builder AS release
