@@ -1,7 +1,7 @@
-go2rtc_url: "http://go2rtc.home:1984/api/frame.jpeg?src=kitchen"
+go2rtc_url: "http://<go2rtc-host>:1984/api/frame.jpeg?src=<camera>"
 
 mqtt:
-  host: mosquitto.home
+  host: localhost
   port: 1883
   keepalive_secs: 30
 

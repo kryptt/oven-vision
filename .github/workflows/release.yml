@@ -37,8 +37,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # amd64-only: deployed on hr-main/media-tv (both amd64). Skipping arm64
-      # avoids QEMU-emulated opencv + clang builds, which would dominate CI.
+      # amd64-only: skipping arm64 avoids QEMU-emulated opencv + clang
+      # builds, which would dominate CI.
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
