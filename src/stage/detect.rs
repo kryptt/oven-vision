@@ -210,7 +210,7 @@ impl Stage for Detect {
 
         let median_radius: f32 = {
             let mut rs: Vec<f32> = candidates.iter().map(|c| c.radius).collect();
-            rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            rs.sort_by(f32::total_cmp);
             if rs.is_empty() {
                 (self.min_radius + self.max_radius) / 2.0
             } else {
@@ -244,7 +244,7 @@ impl Stage for Detect {
                         // Equal weight: position accuracy + radius consistency
                         dist * 0.5 + r_dev * 0.5
                     };
-                    score(a).partial_cmp(&score(b)).unwrap()
+                    score(a).total_cmp(&score(b))
                 });
 
             if let Some((ci, knob)) = best {
@@ -262,7 +262,7 @@ impl Stage for Detect {
             median_radius
         } else {
             let mut sorted: Vec<f32> = real_knobs.iter().map(|k| k.radius).collect();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sorted.sort_by(f32::total_cmp);
             sorted[sorted.len() / 2]
         };
 
@@ -270,7 +270,7 @@ impl Stage for Detect {
             prior_y
         } else {
             let mut sorted: Vec<f32> = real_knobs.iter().map(|k| k.y).collect();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sorted.sort_by(f32::total_cmp);
             sorted[sorted.len() / 2]
         };
 

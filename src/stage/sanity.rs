@@ -70,7 +70,7 @@ impl Sanity {
 
         // Size uniformity of real knobs
         let mut radii: Vec<f32> = real.iter().map(|k| k.radius).collect();
-        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        radii.sort_by(f32::total_cmp);
         let median_r = radii[radii.len() / 2];
         let max_r_dev = real
             .iter()
